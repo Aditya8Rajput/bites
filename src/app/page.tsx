@@ -43,7 +43,7 @@ export default function AuthPage() {
   const [verificationPending, setVerificationPending] = useState(false);
   const isSubmittingRef = useRef(false);
 
-  // Auto-redirect if already authenticated and not in middle of form submission
+  // Auto-redirect if already authenticated and not in the middle of submitting form
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (user) => {
       if (user && !isSubmittingRef.current) {
@@ -93,7 +93,7 @@ export default function AuthPage() {
           console.warn("sendEmailVerification notice:", emailErr);
         }
 
-        // 3. Create initial user profile document in Firestore: users/{uid}
+        // 3. Create initial user document in Firestore under users/{uid}
         await setDoc(
           doc(db, "users", user.uid),
           {
@@ -202,9 +202,13 @@ export default function AuthPage() {
             <span>Randomized 1-on-1 P2P Video Dates</span>
           </div>
 
-          <h1 className="text-4xl sm:text-6xl font-black text-transparent bg-clip-text bg-gradient-to-b from-white via-zinc-100 to-zinc-400 tracking-tight leading-tight mb-4">
-            Find your partner<span className="text-emerald-400">.</span>
+          <h1 className="text-5xl sm:text-7xl font-black text-transparent bg-clip-text bg-gradient-to-b from-white via-zinc-100 to-zinc-400 tracking-tight leading-tight mb-2">
+            Bites<span className="text-emerald-400">.</span>
           </h1>
+
+          <h2 className="text-2xl sm:text-3xl font-bold text-emerald-400 tracking-tight mb-4">
+            Find your partner.
+          </h2>
 
           <p className="text-base sm:text-lg text-zinc-400 max-w-lg mx-auto leading-relaxed">
             High-speed, peer-to-peer 1-on-1 video matching exclusively for verified Thapar University students.
@@ -225,7 +229,7 @@ export default function AuthPage() {
                 }}
                 className={`py-2 text-xs font-semibold rounded-lg transition-all ${
                   mode === "signup"
-                    ? "bg-gradient-to-r from-emerald-500 to-cyan-500 text-black font-bold shadow-lg shadow-emerald-500/25"
+                    ? "bg-gradient-to-r from-emerald-400 to-cyan-400 text-black font-bold shadow-lg shadow-emerald-500/25"
                     : "text-zinc-400 hover:text-zinc-200"
                 }`}
               >
@@ -240,7 +244,7 @@ export default function AuthPage() {
                 }}
                 className={`py-2 text-xs font-semibold rounded-lg transition-all ${
                   mode === "login"
-                    ? "bg-gradient-to-r from-emerald-500 to-cyan-500 text-black font-bold shadow-lg shadow-emerald-500/25"
+                    ? "bg-gradient-to-r from-emerald-400 to-cyan-400 text-black font-bold shadow-lg shadow-emerald-500/25"
                     : "text-zinc-400 hover:text-zinc-200"
                 }`}
               >
@@ -279,7 +283,7 @@ export default function AuthPage() {
               {/* College Email Input */}
               <div>
                 <label className="block text-xs font-mono font-medium text-zinc-300 mb-1.5">
-                  Thapar Email Address <span className="text-emerald-400">*</span>
+                  College Email (@thapar.edu) <span className="text-emerald-400">*</span>
                 </label>
                 <div className="relative">
                   <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-zinc-500">
