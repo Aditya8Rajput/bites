@@ -1,15 +1,25 @@
+"use client";
+
+import { FormEvent, useMemo, useState } from "react";
+import {
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+} from "firebase/auth";
 import {
   BadgeCheck,
   Camera,
   GraduationCap,
   HeartHandshake,
   Lock,
+  LogOut,
+  Mail,
   Mic,
   ShieldCheck,
   Sparkles,
   Video,
   VideoOff,
 } from "lucide-react";
+import { auth, isFirebaseConfigured } from "@/lib/firebase";
 
 const queueStats = [
   { label: "Verified campuses", value: "42" },
@@ -35,7 +45,75 @@ const guardrails = [
   },
 ];
 
+type AuthMode = "sign-in" | "create-account";
+type AuthStatus = "idle" | "submitting" | "authenticated";
+
+function isCollegeEmail(email: string) {
+  return /^[^\s@]+@[^\s@]+\.edu$/i.test(email.trim());
+}
+
 export default function Home() {
+  const [authMode, setAuthMode] = useState<AuthMode>("sign-in");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [status, setStatus] = useState<AuthStatus>("idle");
+  const [error, setError] = useState("");
+  const [queueJoined, setQueueJoined] = useState(false);
+
+  const campusName = useMemo(() => {
+    const domain = email.trim().split("@")[1];
+    if (!domain) {
+      return "your campus";
+    }
+
+    return domain.replace(/\.edu$/i, "").replaceAll(".", " ");
+  }, [email]);
+
+  async function handleAuthSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError("");
+
+    if (!isCollegeEmail(email)) {
+      setError("Use your official .edu college email to continue.");
+      return;
+    }
+
+    if (password.length < 8) {
+      setError("Password must be at least 8 characters.");
+      return;
+    }
+
+    setStatus("submitting");
+
+    try {
+      if (auth && isFirebaseConfigured) {
+        if (authMode === "sign-in") {
+          await signInWithEmailAndPassword(auth, email.trim(), password);
+        } else {
+          await createUserWithEmailAndPassword(auth, email.trim(), password);
+        }
+      }
+
+      setStatus("authenticated");
+      setQueueJoined(false);
+    } catch (authError) {
+      const message =
+        authError instanceof Error
+          ? authError.message
+          : "Could not complete authentication.";
+
+      setStatus("idle");
+      setError(message.replace("Firebase: ", ""));
+    }
+  }
+
+  function resetSession() {
+    setStatus("idle");
+    setQueueJoined(false);
+    setPassword("");
+    setError("");
+  }
+
   return (
     <main className="min-h-screen bg-[#f7f3ec] text-[#151515]">
       <section className="mx-auto grid min-h-screen w-full max-w-7xl grid-cols-1 gap-8 px-5 py-5 sm:px-8 lg:grid-cols-[0.92fr_1.08fr] lg:px-10">
@@ -66,29 +144,152 @@ export default function Home() {
               Meet someone from campus, face to face.
             </h1>
             <p className="mt-5 max-w-lg text-lg leading-8 text-[#5f574f]">
-              Bites matches verified college students into quick private video
-              calls, with no text chat, no group calls, and no recordings.
+              Sign in with your college email before joining the live video
+              queue. No text chat, no group calls, and no recordings.
             </p>
           </div>
 
-          <form className="grid gap-3 rounded-[8px] border border-black/10 bg-white p-3 shadow-sm sm:grid-cols-[1fr_auto]">
-            <label className="sr-only" htmlFor="college-email">
-              College email
-            </label>
-            <input
-              id="college-email"
-              type="email"
-              placeholder="you@college.edu"
-              className="min-h-14 rounded-[6px] border border-black/10 bg-[#fbfaf7] px-4 text-base font-semibold outline-none transition focus:border-[#1b6f9f] focus:bg-white focus:ring-4 focus:ring-[#1b6f9f]/15"
-            />
-            <button
-              type="submit"
-              className="inline-flex min-h-14 items-center justify-center gap-2 rounded-[6px] bg-[#141414] px-5 text-base font-bold text-white transition hover:bg-[#2d2d2d] focus:outline-none focus:ring-4 focus:ring-[#141414]/20"
+          {status === "authenticated" ? (
+            <section className="rounded-[8px] border border-black/10 bg-white p-4 shadow-sm">
+              <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <p className="inline-flex items-center gap-2 text-sm font-bold text-[#17613d]">
+                    <BadgeCheck className="size-4" aria-hidden="true" />
+                    Signed in as {email}
+                  </p>
+                  <h2 className="mt-2 text-2xl font-black text-[#141414]">
+                    Ready for {campusName}
+                  </h2>
+                  <p className="mt-1 text-sm font-semibold text-[#6b6259]">
+                    Join the queue when your camera and microphone are ready.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={resetSession}
+                  className="inline-flex min-h-11 items-center justify-center gap-2 rounded-[6px] border border-black/10 px-4 text-sm font-bold text-[#3d3833] transition hover:bg-[#f5f1ea]"
+                >
+                  <LogOut className="size-4" aria-hidden="true" />
+                  Sign out
+                </button>
+              </div>
+              <button
+                type="button"
+                onClick={() => setQueueJoined(true)}
+                className="mt-4 inline-flex min-h-14 w-full items-center justify-center gap-2 rounded-[6px] bg-[#141414] px-5 text-base font-bold text-white transition hover:bg-[#2d2d2d] focus:outline-none focus:ring-4 focus:ring-[#141414]/20"
+              >
+                <Video className="size-5" aria-hidden="true" />
+                {queueJoined ? "Waiting for a match" : "Join live video queue"}
+              </button>
+            </section>
+          ) : (
+            <form
+              onSubmit={handleAuthSubmit}
+              className="rounded-[8px] border border-black/10 bg-white p-4 shadow-sm"
             >
-              <Video className="size-5" aria-hidden="true" />
-              Join the queue
-            </button>
-          </form>
+              <div className="grid grid-cols-2 gap-2 rounded-[8px] bg-[#f5f1ea] p-1">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthMode("sign-in");
+                    setError("");
+                  }}
+                  className={`min-h-11 rounded-[6px] text-sm font-black transition ${
+                    authMode === "sign-in"
+                      ? "bg-white text-[#141414] shadow-sm"
+                      : "text-[#6b6259] hover:bg-white/60"
+                  }`}
+                >
+                  Sign in
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthMode("create-account");
+                    setError("");
+                  }}
+                  className={`min-h-11 rounded-[6px] text-sm font-black transition ${
+                    authMode === "create-account"
+                      ? "bg-white text-[#141414] shadow-sm"
+                      : "text-[#6b6259] hover:bg-white/60"
+                  }`}
+                >
+                  Create account
+                </button>
+              </div>
+
+              <div className="mt-4 grid gap-3">
+                <div>
+                  <label
+                    className="mb-2 block text-sm font-black text-[#3d3833]"
+                    htmlFor="college-email"
+                  >
+                    College email
+                  </label>
+                  <div className="relative">
+                    <Mail
+                      className="absolute left-4 top-1/2 size-5 -translate-y-1/2 text-[#857b71]"
+                      aria-hidden="true"
+                    />
+                    <input
+                      id="college-email"
+                      type="email"
+                      value={email}
+                      onChange={(event) => setEmail(event.target.value)}
+                      placeholder="you@college.edu"
+                      className="min-h-14 w-full rounded-[6px] border border-black/10 bg-[#fbfaf7] px-12 text-base font-semibold outline-none transition focus:border-[#1b6f9f] focus:bg-white focus:ring-4 focus:ring-[#1b6f9f]/15"
+                      autoComplete="email"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label
+                    className="mb-2 block text-sm font-black text-[#3d3833]"
+                    htmlFor="password"
+                  >
+                    Password
+                  </label>
+                  <input
+                    id="password"
+                    type="password"
+                    value={password}
+                    onChange={(event) => setPassword(event.target.value)}
+                    placeholder="Minimum 8 characters"
+                    className="min-h-14 w-full rounded-[6px] border border-black/10 bg-[#fbfaf7] px-4 text-base font-semibold outline-none transition focus:border-[#1b6f9f] focus:bg-white focus:ring-4 focus:ring-[#1b6f9f]/15"
+                    autoComplete={
+                      authMode === "sign-in"
+                        ? "current-password"
+                        : "new-password"
+                    }
+                  />
+                </div>
+
+                {error ? (
+                  <p className="rounded-[6px] bg-[#fff0ed] px-3 py-2 text-sm font-bold text-[#9e3328]">
+                    {error}
+                  </p>
+                ) : (
+                  <p className="text-sm font-semibold leading-6 text-[#6b6259]">
+                    Only official campus .edu emails can enter Bites.
+                  </p>
+                )}
+
+                <button
+                  type="submit"
+                  disabled={status === "submitting"}
+                  className="inline-flex min-h-14 items-center justify-center gap-2 rounded-[6px] bg-[#141414] px-5 text-base font-bold text-white transition hover:bg-[#2d2d2d] focus:outline-none focus:ring-4 focus:ring-[#141414]/20 disabled:cursor-not-allowed disabled:bg-[#777]"
+                >
+                  <Video className="size-5" aria-hidden="true" />
+                  {status === "submitting"
+                    ? "Checking account"
+                    : authMode === "sign-in"
+                      ? "Sign in to continue"
+                      : "Create account"}
+                </button>
+              </div>
+            </form>
+          )}
 
           <div className="grid grid-cols-3 gap-3">
             {queueStats.map((stat) => (
@@ -111,8 +312,14 @@ export default function Home() {
           <section className="flex flex-1 flex-col overflow-hidden rounded-[8px] border border-black/10 bg-[#161616] text-white shadow-[0_24px_80px_rgba(0,0,0,0.20)]">
             <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
               <div className="flex items-center gap-3">
-                <span className="size-3 rounded-full bg-[#54d17a]" />
-                <p className="text-sm font-bold">Live campus queue</p>
+                <span
+                  className={`size-3 rounded-full ${
+                    queueJoined ? "bg-[#54d17a]" : "bg-[#ffd36c]"
+                  }`}
+                />
+                <p className="text-sm font-bold">
+                  {queueJoined ? "Searching for a match" : "Live campus queue"}
+                </p>
               </div>
               <p className="text-sm font-semibold text-white/60">1:30 match</p>
             </div>
@@ -126,9 +333,13 @@ export default function Home() {
                 </div>
                 <div className="absolute bottom-4 left-4 right-4">
                   <div className="mb-4 aspect-[4/3] rounded-[8px] border border-white/15 bg-white/10 backdrop-blur-sm" />
-                  <p className="text-xl font-black">Maya</p>
+                  <p className="text-xl font-black">
+                    {status === "authenticated" ? "You" : "Student"}
+                  </p>
                   <p className="text-sm font-semibold text-white/70">
-                    Senior - Biology
+                    {status === "authenticated"
+                      ? `${campusName} verified`
+                      : "Sign in to preview"}
                   </p>
                 </div>
               </div>
@@ -141,9 +352,11 @@ export default function Home() {
                 </div>
                 <div className="absolute bottom-4 left-4 right-4">
                   <div className="mb-4 aspect-[4/3] rounded-[8px] border border-white/15 bg-white/10 backdrop-blur-sm" />
-                  <p className="text-xl font-black">Jordan</p>
+                  <p className="text-xl font-black">
+                    {queueJoined ? "Finding match" : "Locked"}
+                  </p>
                   <p className="text-sm font-semibold text-white/70">
-                    Junior - Design
+                    {queueJoined ? "Campus queue active" : "Join after sign in"}
                   </p>
                 </div>
               </div>
@@ -154,6 +367,7 @@ export default function Home() {
                 className="flex size-12 items-center justify-center rounded-[8px] bg-white/10 text-white transition hover:bg-white/20"
                 aria-label="Toggle camera"
                 title="Toggle camera"
+                type="button"
               >
                 <Camera className="size-5" aria-hidden="true" />
               </button>
@@ -161,6 +375,7 @@ export default function Home() {
                 className="flex size-12 items-center justify-center rounded-[8px] bg-white/10 text-white transition hover:bg-white/20"
                 aria-label="Toggle microphone"
                 title="Toggle microphone"
+                type="button"
               >
                 <Mic className="size-5" aria-hidden="true" />
               </button>
@@ -168,6 +383,8 @@ export default function Home() {
                 className="flex size-12 items-center justify-center rounded-[8px] bg-[#d74a3a] text-white transition hover:bg-[#bb3b2d]"
                 aria-label="Leave call"
                 title="Leave call"
+                type="button"
+                onClick={() => setQueueJoined(false)}
               >
                 <VideoOff className="size-5" aria-hidden="true" />
               </button>
