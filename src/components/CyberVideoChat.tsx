@@ -11,11 +11,9 @@ import {
   ShieldAlert,
   Terminal,
   Radio,
-  Wifi,
   RefreshCw,
   Zap,
   PhoneOff,
-  CheckCircle2,
   Camera,
 } from "lucide-react";
 
@@ -32,106 +30,69 @@ interface CyberVideoChatProps {
 }
 
 export default function CyberVideoChat({ onLeave }: CyberVideoChatProps) {
-  // 1. Hydration safety
-  const [mounted, setMounted] = useState(false);
-
-  // Status & error states
+  // UI States ONLY - Streams and Peer instances are kept in Refs to avoid infinite re-renders
   const [status, setStatus] = useState<ConnectionStatus>("Initializing Camera...");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [myPeerId, setMyPeerId] = useState<string | null>(null);
   const [connectedPeerId, setConnectedPeerId] = useState<string | null>(null);
-
-  // Media streams in state to ensure React triggers <video> binding
-  const [localStream, setLocalStream] = useState<MediaStream | null>(null);
-  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
-
-  // Controls state
   const [micEnabled, setMicEnabled] = useState(true);
   const [videoEnabled, setVideoEnabled] = useState(true);
 
-  // Video element and connection references
+  // Video Element Refs
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+
+  // Hardware & Network Objects in Refs (prevents re-render cascades)
   const localStreamRef = useRef<MediaStream | null>(null);
   const peerRef = useRef<Peer | null>(null);
   const currentCallRef = useRef<MediaConnection | null>(null);
+  const myPeerIdRef = useRef<string | null>(null);
   const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
-  const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
-  const isMatchingRef = useRef<boolean>(false);
+  const pollingRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Hydration safety: ensure component mounts on client before browser APIs
-  useEffect(() => {
-    setMounted(true);
-  }, []);
-
-  // Guarantee local video stream attachment
-  useEffect(() => {
-    const videoEl = localVideoRef.current;
-    if (videoEl && localStream) {
-      videoEl.srcObject = localStream;
-      videoEl.onloadedmetadata = () => {
-        videoEl.play().catch((err) => {
-          console.warn("Local video play was prevented:", err);
-        });
-      };
-    }
-  }, [localStream]);
-
-  // Guarantee remote video stream attachment
-  useEffect(() => {
-    const videoEl = remoteVideoRef.current;
-    if (videoEl && remoteStream) {
-      videoEl.srcObject = remoteStream;
-      videoEl.onloadedmetadata = () => {
-        videoEl.play().catch((err) => {
-          console.warn("Remote video play was prevented:", err);
-        });
-      };
-    } else if (videoEl && !remoteStream) {
-      videoEl.srcObject = null;
-    }
-  }, [remoteStream]);
-
-  // Cleanup active remote call & video stream
+  // Helper: Safely close active media connection and clear remote video ref
   const closeCurrentCall = useCallback(() => {
     if (currentCallRef.current) {
       try {
         currentCallRef.current.close();
       } catch (e) {
-        console.warn("Error closing media connection:", e);
+        console.warn("Error closing call:", e);
       }
       currentCallRef.current = null;
     }
-    setRemoteStream(null);
+    if (remoteVideoRef.current) {
+      remoteVideoRef.current.srcObject = null;
+    }
     setConnectedPeerId(null);
   }, []);
 
-  // Handle peer disconnection
+  // Helper: Handle stranger disconnect
   const handleStrangerDisconnected = useCallback(() => {
     closeCurrentCall();
     setStatus("Stranger Disconnected");
-    isMatchingRef.current = false;
   }, [closeCurrentCall]);
 
-  // Stop polling interval
+  // Helper: Stop matchmaking poll interval
   const stopPolling = useCallback(() => {
-    if (pollingIntervalRef.current) {
-      clearInterval(pollingIntervalRef.current);
-      pollingIntervalRef.current = null;
+    if (pollingRef.current) {
+      clearInterval(pollingRef.current);
+      pollingRef.current = null;
     }
   }, []);
 
-  // Wire event handlers to a MediaConnection
-  const setupCallListeners = useCallback(
+  // Wire incoming/outgoing MediaConnection events
+  const attachCallEvents = useCallback(
     (call: MediaConnection, remoteId: string) => {
       stopPolling();
       currentCallRef.current = call;
       setConnectedPeerId(remoteId);
+      setStatus("Connected");
 
-      call.on("stream", (stream: MediaStream) => {
-        setRemoteStream(stream);
+      call.on("stream", (remoteStream: MediaStream) => {
+        if (remoteVideoRef.current) {
+          remoteVideoRef.current.srcObject = remoteStream;
+          remoteVideoRef.current.play().catch(() => {});
+        }
         setStatus("Connected");
-        isMatchingRef.current = false;
       });
 
       call.on("close", () => {
@@ -139,351 +100,282 @@ export default function CyberVideoChat({ onLeave }: CyberVideoChatProps) {
       });
 
       call.on("error", (err) => {
-        console.warn("PeerJS call error:", err);
+        console.warn("MediaConnection error:", err);
         handleStrangerDisconnected();
       });
     },
     [handleStrangerDisconnected, stopPolling]
   );
 
-  // 1. CAMERA & MICROPHONE INITIALIZATION
-  // Runs strictly inside useEffect after hydration
-  const initMedia = useCallback(async () => {
-    setStatus("Initializing Camera...");
-    setErrorMessage(null);
+  // Matchmaking: Find stranger via Next.js API & local BroadcastChannel
+  const searchForStranger = useCallback(async () => {
+    if (!peerRef.current || !localStreamRef.current || !myPeerIdRef.current) return;
 
-    if (typeof window === "undefined") return null;
-
-    // Check secure context (WebRTC requires HTTPS or localhost)
-    const isLocalhost =
-      window.location.hostname === "localhost" ||
-      window.location.hostname === "127.0.0.1";
-    if (!window.isSecureContext && !isLocalhost) {
-      setStatus("Hardware Error");
-      setErrorMessage(
-        "INSECURE_CONTEXT: WebRTC media devices require HTTPS or http://localhost. If opening over LAN, please use localhost."
-      );
-      return null;
-    }
-
-    if (!navigator?.mediaDevices?.getUserMedia) {
-      setStatus("Hardware Error");
-      setErrorMessage(
-        "MEDIA_UNAVAILABLE: Your browser does not support navigator.mediaDevices.getUserMedia."
-      );
-      return null;
-    }
-
-    // Release any previous tracks before re-requesting
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach((track) => track.stop());
-      localStreamRef.current = null;
-    }
-
-    let stream: MediaStream | null = null;
-
-    try {
-      // Primary attempt: Request both camera and audio
-      stream = await navigator.mediaDevices.getUserMedia({
-        video: true,
-        audio: true,
-      });
-    } catch (primaryErr: unknown) {
-      const err = primaryErr as { name?: string; message?: string };
-      console.warn("Full media request failed, attempting video-only fallback:", err);
-
-      // Fallback attempt: If microphone is missing or errored, try video only
-      if (err.name === "NotFoundError" || err.name === "OverconstrainedError") {
-        try {
-          stream = await navigator.mediaDevices.getUserMedia({
-            video: true,
-            audio: false,
-          });
-          setMicEnabled(false);
-        } catch (fallbackErr: unknown) {
-          const fbErr = fallbackErr as { name?: string; message?: string };
-          err.name = fbErr.name;
-          err.message = fbErr.message;
-        }
-      }
-
-      if (!stream) {
-        if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError") {
-          setStatus("Permission Denied");
-          setErrorMessage(
-            "Permission Denied: Camera and Microphone access was blocked. Please click the camera icon in your browser's address bar to allow permissions."
-          );
-        } else if (err.name === "NotFoundError" || err.name === "DevicesNotFoundError") {
-          setStatus("Hardware Error");
-          setErrorMessage(
-            "Hardware Not Found: No camera or microphone device was detected on your computer."
-          );
-        } else if (err.name === "NotReadableError" || err.name === "TrackStartError") {
-          setStatus("Hardware Error");
-          setErrorMessage(
-            "Device In Use: The camera or microphone is currently reserved by another app or browser tab."
-          );
-        } else {
-          setStatus("Hardware Error");
-          setErrorMessage(
-            `Hardware Error: ${err.message || "Failed to initialize media stream."}`
-          );
-        }
-        return null;
-      }
-    }
-
-    localStreamRef.current = stream;
-    setLocalStream(stream);
-    setMicEnabled(stream.getAudioTracks().length > 0);
-    setVideoEnabled(stream.getVideoTracks().length > 0);
-    setStatus("Searching for Stranger...");
-
-    return stream;
-  }, []);
-
-  // 2. REAL-TIME 1-ON-1 P2P CONNECTION (PeerJS & Matchmaking)
-  const findStranger = useCallback(async () => {
-    if (!peerRef.current || !localStreamRef.current || !myPeerId) return;
-
-    isMatchingRef.current = true;
     closeCurrentCall();
     stopPolling();
     setStatus("Searching for Stranger...");
 
-    const localStreamObj = localStreamRef.current;
-    const currentId = myPeerId;
+    const myId = myPeerIdRef.current;
+    const stream = localStreamRef.current;
 
-    // Strategy A: Local BroadcastChannel (instant matching for tabs on the same computer)
+    // Strategy 1: Local BroadcastChannel for immediate multi-tab matching
     if (broadcastChannelRef.current) {
       broadcastChannelRef.current.postMessage({
         type: "WAITING",
-        peerId: currentId,
+        peerId: myId,
       });
     }
 
-    // Strategy B: Matchmaking API Route (cross-device, cross-network matching)
+    // Strategy 2: Built-in Next.js Matchmaking API route
     try {
       const res = await fetch("/api/match", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ peerId: currentId }),
+        body: JSON.stringify({ peerId: myId }),
       });
-
       const data = await res.json();
 
+      // If server matched us with a waiting peer, call them
       if (data.status === "matched" && data.matchPeerId && data.initiator) {
-        // We were matched with a waiting peer! Initiate the WebRTC media call
-        const call = peerRef.current.call(data.matchPeerId, localStreamObj);
+        const call = peerRef.current.call(data.matchPeerId, stream);
         if (call) {
-          setupCallListeners(call, data.matchPeerId);
+          attachCallEvents(call, data.matchPeerId);
           return;
         }
       }
 
-      // If waiting in queue, poll the matchmaking endpoint until someone pairs with us
+      // If waiting in queue, poll the matchmaking endpoint
       if (data.status === "waiting") {
-        pollingIntervalRef.current = setInterval(async () => {
+        pollingRef.current = setInterval(async () => {
           if (!peerRef.current || currentCallRef.current) {
             stopPolling();
             return;
           }
 
           try {
-            const pollRes = await fetch(`/api/match?peerId=${encodeURIComponent(currentId)}`);
+            const pollRes = await fetch(`/api/match?peerId=${encodeURIComponent(myId)}`);
             const pollData = await pollRes.json();
 
             if (pollData.status === "matched" && pollData.matchPeerId) {
               stopPolling();
-              // The other peer will initiate the call to us, or we initiate if not started yet
-              if (!currentCallRef.current) {
-                const call = peerRef.current.call(pollData.matchPeerId, localStreamObj);
+              if (!currentCallRef.current && peerRef.current && localStreamRef.current) {
+                const call = peerRef.current.call(pollData.matchPeerId, localStreamRef.current);
                 if (call) {
-                  setupCallListeners(call, pollData.matchPeerId);
+                  attachCallEvents(call, pollData.matchPeerId);
                 }
               }
             }
           } catch (e) {
-            console.warn("Polling matchmaking notice:", e);
+            console.warn("Poll notice:", e);
           }
         }, 2000);
       }
-    } catch (apiErr) {
-      console.warn("Matchmaking API notice:", apiErr);
+    } catch (e) {
+      console.warn("Matchmaking API notice:", e);
     }
-  }, [myPeerId, closeCurrentCall, setupCallListeners, stopPolling]);
+  }, [attachCallEvents, closeCurrentCall, stopPolling]);
 
-  // Leave matchmaking queue on server
-  const leaveQueue = useCallback(async () => {
-    stopPolling();
-    if (myPeerId) {
-      try {
-        await fetch(`/api/match?peerId=${encodeURIComponent(myPeerId)}`, {
-          method: "DELETE",
-        });
-      } catch (e) {}
-    }
-  }, [myPeerId, stopPolling]);
-
-  // Setup PeerJS and Media on mount
+  // SINGLE MOUNT EFFECT: Empty dependency array []
+  // Runs getUserMedia and initializes PeerJS once on component mount
   useEffect(() => {
-    if (!mounted) return;
-
-    let peerInstance: Peer | null = null;
     let channel: BroadcastChannel | null = null;
+    let localStream: MediaStream | null = null;
+    let peerInstance: Peer | null = null;
 
-    const setupP2P = async () => {
-      // 1. Initialize local media
-      const stream = await initMedia();
-      if (!stream) return;
+    const init = async () => {
+      // 1. Camera & Microphone Initialization
+      try {
+        if (!navigator?.mediaDevices?.getUserMedia) {
+          setStatus("Hardware Error");
+          setErrorMessage("Browser does not support mediaDevices.getUserMedia.");
+          return;
+        }
 
-      // 2. Dynamically import PeerJS on client
-      const { Peer } = await import("peerjs");
-
-      // Unique ID for this peer
-      const randomId = `bites-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 7)}`;
-
-      peerInstance = new Peer(randomId, {
-        debug: 1,
-        config: {
-          iceServers: [
-            { urls: "stun:stun.l.google.com:19302" },
-            { urls: "stun:stun1.l.google.com:19302" },
-            { urls: "stun:stun2.l.google.com:19302" },
-            { urls: "stun:stun.cloudflare.com:3478" },
-          ],
-        },
-      });
-      peerRef.current = peerInstance;
-
-      // 3. Setup BroadcastChannel for zero-latency same-computer tab testing
-      if (typeof window !== "undefined" && "BroadcastChannel" in window) {
-        channel = new BroadcastChannel("bites_matchmaking");
-        broadcastChannelRef.current = channel;
-
-        channel.onmessage = (event) => {
-          const msg = event.data;
-          if (!msg || !localStreamRef.current || !peerRef.current) return;
-
-          // Received WAITING from another tab
-          if (msg.type === "WAITING" && msg.peerId !== peerRef.current.id && !currentCallRef.current) {
-            const call = peerRef.current.call(msg.peerId, localStreamRef.current);
-            if (call) {
-              setupCallListeners(call, msg.peerId);
-              channel?.postMessage({
-                type: "MATCH_CONFIRMED",
-                callerId: peerRef.current.id,
-                targetId: msg.peerId,
-              });
-            }
+        // Try video + audio first, fall back to video only if no microphone is found
+        try {
+          localStream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: true,
+          });
+        } catch (initialErr: unknown) {
+          const err = initialErr as { name?: string };
+          if (err.name === "NotFoundError" || err.name === "OverconstrainedError") {
+            localStream = await navigator.mediaDevices.getUserMedia({
+              video: true,
+              audio: false,
+            });
+            setMicEnabled(false);
+          } else {
+            throw initialErr;
           }
+        }
 
-          if (msg.type === "MATCH_CONFIRMED" && msg.targetId === peerRef.current.id) {
-            isMatchingRef.current = false;
-            stopPolling();
-          }
-        };
+        localStreamRef.current = localStream;
+
+        // Assign to local video element ref
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = localStream;
+          localVideoRef.current.play().catch(() => {});
+        }
+
+        setStatus("Searching for Stranger...");
+      } catch (err: unknown) {
+        const error = err as { name?: string; message?: string };
+        console.error("Camera/Mic initialization error:", err);
+
+        if (error.name === "NotAllowedError" || error.name === "PermissionDeniedError") {
+          setStatus("Permission Denied");
+          setErrorMessage(
+            "Camera & Microphone access was denied. Please allow permissions in your browser bar."
+          );
+        } else if (error.name === "NotFoundError" || error.name === "DevicesNotFoundError") {
+          setStatus("Hardware Error");
+          setErrorMessage("No camera hardware detected on this computer.");
+        } else if (error.name === "NotReadableError" || error.name === "TrackStartError") {
+          setStatus("Hardware Error");
+          setErrorMessage("Camera is currently in use by another app or browser tab.");
+        } else {
+          setStatus("Hardware Error");
+          setErrorMessage(error.message || "Failed to access media hardware.");
+        }
+        return;
       }
 
-      // Peer connected to signaling server
-      peerInstance.on("open", (id: string) => {
-        setMyPeerId(id);
-      });
+      // 2. PeerJS Initialization
+      try {
+        const { Peer } = await import("peerjs");
+        const randomId = `bites-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 7)}`;
+        myPeerIdRef.current = randomId;
 
-      // Answering incoming media call
-      peerInstance.on("call", (incomingCall: MediaConnection) => {
-        if (!localStreamRef.current) return;
-        incomingCall.answer(localStreamRef.current);
-        setupCallListeners(incomingCall, incomingCall.peer);
-      });
+        peerInstance = new Peer(randomId, {
+          debug: 1,
+          config: {
+            iceServers: [
+              { urls: "stun:stun.l.google.com:19302" },
+              { urls: "stun:stun1.l.google.com:19302" },
+              { urls: "stun:stun2.l.google.com:19302" },
+              { urls: "stun:stun.cloudflare.com:3478" },
+            ],
+          },
+        });
+        peerRef.current = peerInstance;
 
-      // Peer error handling
-      peerInstance.on("error", (err) => {
-        console.warn("PeerJS error:", err);
-      });
+        // BroadcastChannel for instant same-machine testing
+        if (typeof window !== "undefined" && "BroadcastChannel" in window) {
+          channel = new BroadcastChannel("bites_matchmaking");
+          broadcastChannelRef.current = channel;
+
+          channel.onmessage = (event) => {
+            const msg = event.data;
+            if (!msg || !localStreamRef.current || !peerRef.current) return;
+
+            if (msg.type === "WAITING" && msg.peerId !== myPeerIdRef.current && !currentCallRef.current) {
+              const call = peerRef.current.call(msg.peerId, localStreamRef.current);
+              if (call) {
+                attachCallEvents(call, msg.peerId);
+                channel?.postMessage({
+                  type: "MATCH_CONFIRMED",
+                  callerId: myPeerIdRef.current,
+                  targetId: msg.peerId,
+                });
+              }
+            }
+          };
+        }
+
+        // When Peer is connected to signaling server
+        peerInstance.on("open", () => {
+          searchForStranger();
+        });
+
+        // Answer incoming media calls automatically with localStreamRef.current
+        peerInstance.on("call", (incomingCall: MediaConnection) => {
+          if (!localStreamRef.current) return;
+          incomingCall.answer(localStreamRef.current);
+          attachCallEvents(incomingCall, incomingCall.peer);
+        });
+
+        peerInstance.on("error", (err) => {
+          console.warn("PeerJS subsystem error:", err);
+        });
+      } catch (peerErr) {
+        console.error("PeerJS initialization error:", peerErr);
+      }
     };
 
-    setupP2P();
+    init();
 
-    // Cleanup on unmount
+    // CLEANUP ON UNMOUNT: Release all media tracks and destroy peer
     return () => {
       stopPolling();
-      // Stop all camera and mic hardware tracks
+
+      // Stop all camera and microphone hardware tracks
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach((track) => track.stop());
         localStreamRef.current = null;
       }
-      // Close active media call
+
+      // Close active call
       if (currentCallRef.current) {
         try {
           currentCallRef.current.close();
         } catch (e) {}
         currentCallRef.current = null;
       }
+
       // Close BroadcastChannel
       if (channel) {
         channel.close();
       }
-      // Leave server matchmaking queue
-      leaveQueue();
-      // Destroy Peer instance
+
+      // Remove from server queue
+      if (myPeerIdRef.current) {
+        fetch(`/api/match?peerId=${encodeURIComponent(myPeerIdRef.current)}`, {
+          method: "DELETE",
+        }).catch(() => {});
+      }
+
+      // Destroy PeerJS instance
       if (peerInstance) {
         peerInstance.destroy();
         peerRef.current = null;
       }
     };
-  }, [mounted, initMedia, setupCallListeners, leaveQueue, stopPolling]);
+  }, []); // Strictly empty dependency array [] as requested
 
-  // Once peer ID is registered and local stream exists, automatically start matchmaking
-  useEffect(() => {
-    if (myPeerId && localStreamRef.current) {
-      findStranger();
-    }
-  }, [myPeerId, findStranger]);
-
-  // 3. CONTROLS: Toggle Microphone Audio Track
+  // CONTROLS: Toggle Microphone
   const toggleMic = () => {
     if (!localStreamRef.current) return;
     const audioTracks = localStreamRef.current.getAudioTracks();
+    if (audioTracks.length === 0) return;
+    const nextState = !micEnabled;
     audioTracks.forEach((track) => {
-      track.enabled = !micEnabled;
+      track.enabled = nextState;
     });
-    setMicEnabled((prev) => !prev);
+    setMicEnabled(nextState);
   };
 
-  // 3. CONTROLS: Toggle Camera Video Track
+  // CONTROLS: Toggle Camera Video
   const toggleVideo = () => {
     if (!localStreamRef.current) return;
     const videoTracks = localStreamRef.current.getVideoTracks();
+    if (videoTracks.length === 0) return;
+    const nextState = !videoEnabled;
     videoTracks.forEach((track) => {
-      track.enabled = !videoEnabled;
+      track.enabled = nextState;
     });
-    setVideoEnabled((prev) => !prev);
+    setVideoEnabled(nextState);
   };
 
-  // 3. CONTROLS: Next / Skip Button
+  // CONTROLS: Next / Skip Button
   const handleNext = () => {
     closeCurrentCall();
-    findStranger();
+    searchForStranger();
   };
-
-  // Hydration fallback
-  if (!mounted) {
-    return (
-      <div className="min-h-screen w-full bg-[#0a0a0a] flex items-center justify-center font-mono">
-        <div className="flex flex-col items-center gap-4 text-emerald-400">
-          <Terminal className="w-8 h-8 animate-pulse text-emerald-400" />
-          <p className="text-xs uppercase tracking-[0.3em] animate-pulse">
-            INITIALIZING_CYBER_P2P_SUBSYSTEM...
-          </p>
-        </div>
-      </div>
-    );
-  }
 
   return (
     <div className="relative min-h-screen w-full bg-[#0a0a0a] text-zinc-100 font-sans overflow-hidden flex flex-col justify-between selection:bg-emerald-500/30 selection:text-emerald-200">
-      {/* Background Ambience & Cyber Grid */}
+      {/* Ambient Cyber Backdrops */}
       <div className="fixed inset-0 pointer-events-none z-0 overflow-hidden">
         <div className="absolute -top-40 -left-40 w-[600px] h-[600px] bg-emerald-500/10 rounded-full blur-[160px]" />
         <div className="absolute -bottom-40 -right-40 w-[600px] h-[600px] bg-cyan-500/10 rounded-full blur-[160px]" />
@@ -557,10 +449,10 @@ export default function CyberVideoChat({ onLeave }: CyberVideoChatProps) {
               <span>{errorMessage}</span>
             </div>
             <button
-              onClick={initMedia}
+              onClick={() => window.location.reload()}
               className="px-4 py-2 rounded-lg bg-red-500/20 hover:bg-red-500/30 border border-red-400/50 text-red-200 transition-all cursor-pointer font-bold tracking-wider"
             >
-              RETRY CAMERA PERMISSION
+              RELOAD & RETRY
             </button>
           </div>
         )}
@@ -575,13 +467,13 @@ export default function CyberVideoChat({ onLeave }: CyberVideoChatProps) {
 
           {/* 1. Large Main View: Remote Stranger's Video Canvas */}
           <div className="w-full h-full relative flex items-center justify-center bg-black">
-            {/* Real Remote Video Element - ALWAYS kept in DOM to allow continuous audio/video decode */}
+            {/* Real Remote Video Element - ALWAYS rendered to allow continuous decoding */}
             <video
               ref={remoteVideoRef}
               autoPlay
               playsInline
               className={`w-full h-full object-cover transition-opacity duration-300 ${
-                status === "Connected" && remoteStream ? "opacity-100" : "opacity-0 absolute"
+                status === "Connected" ? "opacity-100" : "opacity-0 absolute"
               }`}
             />
 
@@ -637,14 +529,8 @@ export default function CyberVideoChat({ onLeave }: CyberVideoChatProps) {
                 <Camera className="w-12 h-12 text-red-400" />
                 <p className="text-red-300 font-bold text-sm">CAMERA PERMISSION REQUIRED</p>
                 <p className="text-zinc-400 text-xs">
-                  Please click the lock or camera icon in your browser URL bar to grant camera and microphone access.
+                  Please click the lock/camera icon in your browser address bar to grant camera and microphone access.
                 </p>
-                <button
-                  onClick={initMedia}
-                  className="mt-2 px-5 py-2 rounded-xl bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400 text-emerald-300 text-xs font-bold transition-all cursor-pointer"
-                >
-                  ENABLE CAMERA NOW
-                </button>
               </div>
             )}
 
@@ -675,7 +561,7 @@ export default function CyberVideoChat({ onLeave }: CyberVideoChatProps) {
               }`}
             />
 
-            {/* Video Paused / Camera Off Placeholder */}
+            {/* Video Paused Placeholder */}
             {!videoEnabled && (
               <div className="w-full h-full flex flex-col items-center justify-center bg-zinc-950 font-mono text-[10px] text-zinc-500">
                 <VideoOff className="w-6 h-6 mb-1 text-zinc-600" />
@@ -692,7 +578,7 @@ export default function CyberVideoChat({ onLeave }: CyberVideoChatProps) {
         </div>
       </main>
 
-      {/* 3. Glassmorphic Hacker Control Dock */}
+      {/* Control Dock */}
       <footer className="relative z-20 w-full max-w-4xl mx-auto px-4 pb-6 pt-2">
         <div className="p-3 sm:p-4 rounded-2xl bg-zinc-950/70 border border-emerald-500/30 backdrop-blur-2xl shadow-[0_0_35px_rgba(16,185,129,0.15)] flex flex-wrap items-center justify-between gap-3">
           {/* Audio / Video Controls */}
@@ -700,12 +586,11 @@ export default function CyberVideoChat({ onLeave }: CyberVideoChatProps) {
             {/* Mute / Unmute Mic Button */}
             <button
               onClick={toggleMic}
-              disabled={!localStream}
               className={`flex items-center gap-2 px-3.5 sm:px-4 py-2.5 rounded-xl font-mono text-xs font-semibold tracking-wider transition-all duration-200 cursor-pointer border ${
                 micEnabled
                   ? "bg-zinc-900/90 text-emerald-300 border-emerald-500/40 hover:bg-emerald-500/20 hover:border-emerald-400 shadow-[0_0_15px_rgba(16,185,129,0.15)]"
                   : "bg-red-950/50 text-red-300 border-red-500/50 hover:bg-red-900/50 shadow-[0_0_15px_rgba(239,68,68,0.2)]"
-              } disabled:opacity-40 disabled:cursor-not-allowed`}
+              }`}
               title={micEnabled ? "Mute Microphone" : "Unmute Microphone"}
             >
               {micEnabled ? (
@@ -719,12 +604,11 @@ export default function CyberVideoChat({ onLeave }: CyberVideoChatProps) {
             {/* Stop / Start Video Button */}
             <button
               onClick={toggleVideo}
-              disabled={!localStream}
               className={`flex items-center gap-2 px-3.5 sm:px-4 py-2.5 rounded-xl font-mono text-xs font-semibold tracking-wider transition-all duration-200 cursor-pointer border ${
                 videoEnabled
                   ? "bg-zinc-900/90 text-emerald-300 border-emerald-500/40 hover:bg-emerald-500/20 hover:border-emerald-400 shadow-[0_0_15px_rgba(16,185,129,0.15)]"
                   : "bg-red-950/50 text-red-300 border-red-500/50 hover:bg-red-900/50 shadow-[0_0_15px_rgba(239,68,68,0.2)]"
-              } disabled:opacity-40 disabled:cursor-not-allowed`}
+              }`}
               title={videoEnabled ? "Stop Video Feed" : "Start Video Feed"}
             >
               {videoEnabled ? (
@@ -740,7 +624,7 @@ export default function CyberVideoChat({ onLeave }: CyberVideoChatProps) {
           <div className="flex items-center gap-2">
             <button
               onClick={handleNext}
-              disabled={status === "Searching for Stranger..." || !localStream}
+              disabled={status === "Searching for Stranger..."}
               className="flex items-center gap-2.5 px-6 sm:px-8 py-2.5 sm:py-3 rounded-xl font-mono text-xs sm:text-sm font-black tracking-wider uppercase transition-all duration-300 cursor-pointer bg-gradient-to-r from-emerald-500 to-cyan-500 hover:from-emerald-400 hover:to-cyan-400 text-black shadow-[0_0_25px_rgba(16,185,129,0.4)] hover:shadow-[0_0_35px_rgba(6,182,212,0.6)] active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               {status === "Searching for Stranger..." ? (
