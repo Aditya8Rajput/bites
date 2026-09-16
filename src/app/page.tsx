@@ -210,9 +210,19 @@ export default function AuthPage() {
             Find your partner.
           </h2>
 
-          <p className="text-base sm:text-lg text-zinc-400 max-w-lg mx-auto leading-relaxed">
+          <p className="text-base sm:text-lg text-zinc-400 max-w-lg mx-auto leading-relaxed mb-5">
             High-speed, peer-to-peer 1-on-1 video matching exclusively for verified Thapar University students.
           </p>
+
+          <div className="flex items-center justify-center gap-3">
+            <button
+              onClick={() => router.push("/call")}
+              className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-emerald-400 via-teal-400 to-cyan-400 hover:from-emerald-300 hover:to-cyan-300 text-black font-mono font-black text-xs uppercase tracking-wider flex items-center gap-2 shadow-[0_0_25px_rgba(16,185,129,0.3)] hover:shadow-[0_0_35px_rgba(6,182,212,0.5)] transition-all cursor-pointer transform hover:scale-105 active:scale-95"
+            >
+              <Zap className="w-4 h-4 fill-black text-black" />
+              <span>Launch Cyber Video Chat</span>
+            </button>
+          </div>
         </div>
 
         {/* Authentication Glass Card */}
