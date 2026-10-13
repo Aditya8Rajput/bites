@@ -2,24 +2,36 @@
 
 import React, { useEffect, useRef, useState, useCallback } from "react";
 import type { Peer, MediaConnection } from "peerjs";
+import { User } from "firebase/auth";
+import { auth } from "@/lib/firebase";
+import {
+  ICE_SERVERS,
+  findOrQueueMatch,
+  listenForIncomingMatch,
+  listenToActiveMatch,
+  endMatchSession,
+  leaveMatchQueue,
+} from "@/lib/matchmaking";
 import {
   Mic,
   MicOff,
   Video as VideoIcon,
   VideoOff,
   SkipForward,
-  ShieldAlert,
-  Terminal,
-  Radio,
-  RefreshCw,
-  Zap,
-  PhoneOff,
+  XCircle,
+  Flag,
+  Heart,
+  Loader2,
+  AlertTriangle,
   Camera,
+  RefreshCw,
+  Radio,
+  Zap,
 } from "lucide-react";
 
 export type ConnectionStatus =
   | "Initializing Camera..."
-  | "Searching for Stranger..."
+  | "Looking for a stranger..."
   | "Connected"
   | "Stranger Disconnected"
   | "Permission Denied"
@@ -27,35 +39,68 @@ export type ConnectionStatus =
 
 interface CyberVideoChatProps {
   onLeave?: () => void;
+  user?: User | null;
 }
 
-export default function CyberVideoChat({ onLeave }: CyberVideoChatProps) {
-  // UI States ONLY - Streams and Peer instances are kept in Refs to avoid infinite re-renders
+export default function CyberVideoChat({ onLeave, user: propUser }: CyberVideoChatProps) {
+  // UI Presentation States ONLY (never store MediaStreams or Peer instances in state)
   const [status, setStatus] = useState<ConnectionStatus>("Initializing Camera...");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [connectedPeerId, setConnectedPeerId] = useState<string | null>(null);
   const [micEnabled, setMicEnabled] = useState(true);
   const [videoEnabled, setVideoEnabled] = useState(true);
+  const [stopConfirm, setStopConfirm] = useState(false);
+  const [reported, setReported] = useState(false);
+  const [liked, setLiked] = useState(false);
 
   // Video Element Refs
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
 
-  // Hardware & Network Objects in Refs (prevents re-render cascades)
+  // Hardware & Network Objects in Refs (prevents re-render cascades & memory leaks)
   const localStreamRef = useRef<MediaStream | null>(null);
   const peerRef = useRef<Peer | null>(null);
   const currentCallRef = useRef<MediaConnection | null>(null);
   const myPeerIdRef = useRef<string | null>(null);
-  const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
-  const pollingRef = useRef<NodeJS.Timeout | null>(null);
+  const currentMatchIdRef = useRef<string | null>(null);
+  const matchListenerUnsubRef = useRef<(() => void) | null>(null);
+  const queueListenerUnsubRef = useRef<(() => void) | null>(null);
+  const callTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const isMatchmakingActiveRef = useRef(false);
 
-  // Helper: Safely close active media connection and clear remote video ref
+  // Helper: Get active authenticated user UID
+  const getUserId = useCallback((): { uid: string; email: string } => {
+    const active = propUser || auth.currentUser;
+    if (active) {
+      return { uid: active.uid, email: active.email || "user@gmail.com" };
+    }
+    // Fallback guest identifier if accessed directly in local dev
+    let guestId = "";
+    if (typeof window !== "undefined") {
+      guestId = sessionStorage.getItem("bites_guest_uid") || "";
+      if (!guestId) {
+        guestId = `guest_${Math.random().toString(36).substring(2, 9)}`;
+        sessionStorage.setItem("bites_guest_uid", guestId);
+      }
+    }
+    return { uid: guestId || "guest_default", email: "guest@bites.live" };
+  }, [propUser]);
+
+  // Clean up any ongoing active WebRTC MediaConnection and clear remote video feed
   const closeCurrentCall = useCallback(() => {
+    if (callTimeoutRef.current) {
+      clearTimeout(callTimeoutRef.current);
+      callTimeoutRef.current = null;
+    }
+    if (matchListenerUnsubRef.current) {
+      matchListenerUnsubRef.current();
+      matchListenerUnsubRef.current = null;
+    }
     if (currentCallRef.current) {
       try {
         currentCallRef.current.close();
       } catch (e) {
-        console.warn("Error closing call:", e);
+        console.warn("Notice closing media connection:", e);
       }
       currentCallRef.current = null;
     }
@@ -63,31 +108,37 @@ export default function CyberVideoChat({ onLeave }: CyberVideoChatProps) {
       remoteVideoRef.current.srcObject = null;
     }
     setConnectedPeerId(null);
+    setLiked(false);
+    setReported(false);
   }, []);
 
-  // Helper: Handle stranger disconnect
+  // Handle Stranger disconnect (called when peer hangs up, clicks Next, or leaves)
   const handleStrangerDisconnected = useCallback(() => {
     closeCurrentCall();
     setStatus("Stranger Disconnected");
   }, [closeCurrentCall]);
 
-  // Helper: Stop matchmaking poll interval
-  const stopPolling = useCallback(() => {
-    if (pollingRef.current) {
-      clearInterval(pollingRef.current);
-      pollingRef.current = null;
-    }
-  }, []);
-
   // Wire incoming/outgoing MediaConnection events
   const attachCallEvents = useCallback(
-    (call: MediaConnection, remoteId: string) => {
-      stopPolling();
+    (call: MediaConnection, remotePeerId: string, matchId: string) => {
       currentCallRef.current = call;
-      setConnectedPeerId(remoteId);
-      setStatus("Connected");
+      setConnectedPeerId(remotePeerId);
+      currentMatchIdRef.current = matchId;
 
+      // Listen for remote peer disconnecting in Firestore
+      if (matchListenerUnsubRef.current) {
+        matchListenerUnsubRef.current();
+      }
+      matchListenerUnsubRef.current = listenToActiveMatch(matchId, () => {
+        handleStrangerDisconnected();
+      });
+
+      // Stream event: remote audio & video received
       call.on("stream", (remoteStream: MediaStream) => {
+        if (callTimeoutRef.current) {
+          clearTimeout(callTimeoutRef.current);
+          callTimeoutRef.current = null;
+        }
         if (remoteVideoRef.current) {
           remoteVideoRef.current.srcObject = remoteStream;
           remoteVideoRef.current.play().catch(() => {});
@@ -104,97 +155,110 @@ export default function CyberVideoChat({ onLeave }: CyberVideoChatProps) {
         handleStrangerDisconnected();
       });
     },
-    [handleStrangerDisconnected, stopPolling]
+    [handleStrangerDisconnected]
   );
 
-  // Matchmaking: Find stranger via Next.js API & local BroadcastChannel
+  // Execute Matchmaking search via shared atomic Firestore coordinator
   const searchForStranger = useCallback(async () => {
     if (!peerRef.current || !localStreamRef.current || !myPeerIdRef.current) return;
+    if (isMatchmakingActiveRef.current) return;
 
+    isMatchmakingActiveRef.current = true;
     closeCurrentCall();
-    stopPolling();
-    setStatus("Searching for Stranger...");
+    setStatus("Looking for a stranger...");
 
-    const myId = myPeerIdRef.current;
-    const stream = localStreamRef.current;
-
-    // Strategy 1: Local BroadcastChannel for immediate multi-tab matching
-    if (broadcastChannelRef.current) {
-      broadcastChannelRef.current.postMessage({
-        type: "WAITING",
-        peerId: myId,
-      });
+    // End previous match session if any
+    if (currentMatchIdRef.current) {
+      endMatchSession(currentMatchIdRef.current).catch(() => {});
+      currentMatchIdRef.current = null;
     }
 
-    // Strategy 2: Built-in Next.js Matchmaking API route
+    const { uid, email } = getUserId();
+    const myPeerId = myPeerIdRef.current;
+    const localStream = localStreamRef.current;
+
     try {
-      const res = await fetch("/api/match", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ peerId: myId }),
-      });
-      const data = await res.json();
+      const matchResult = await findOrQueueMatch(uid, myPeerId, email);
 
-      // If server matched us with a waiting peer, call them
-      if (data.status === "matched" && data.matchPeerId && data.initiator) {
-        const call = peerRef.current.call(data.matchPeerId, stream);
-        if (call) {
-          attachCallEvents(call, data.matchPeerId);
-          return;
-        }
-      }
+      if (matchResult.matched && matchResult.role === "initiator" && matchResult.remotePeerId && matchResult.matchId) {
+        // CASE A: Current user is the INITIATOR
+        currentMatchIdRef.current = matchResult.matchId;
 
-      // If waiting in queue, poll the matchmaking endpoint
-      if (data.status === "waiting") {
-        pollingRef.current = setInterval(async () => {
-          if (!peerRef.current || currentCallRef.current) {
-            stopPolling();
-            return;
-          }
+        // Small delay to ensure receiver's PeerJS is ready to receive incoming offer
+        setTimeout(() => {
+          if (!peerRef.current || !localStreamRef.current) return;
+          const call = peerRef.current.call(matchResult.remotePeerId!, localStream);
+          if (call) {
+            attachCallEvents(call, matchResult.remotePeerId!, matchResult.matchId!);
 
-          try {
-            const pollRes = await fetch(`/api/match?peerId=${encodeURIComponent(myId)}`);
-            const pollData = await pollRes.json();
-
-            if (pollData.status === "matched" && pollData.matchPeerId) {
-              stopPolling();
-              if (!currentCallRef.current && peerRef.current && localStreamRef.current) {
-                const call = peerRef.current.call(pollData.matchPeerId, localStreamRef.current);
-                if (call) {
-                  attachCallEvents(call, pollData.matchPeerId);
-                }
+            // 8-second safety timeout if peer doesn't respond or ICE fails
+            callTimeoutRef.current = setTimeout(() => {
+              if (status !== "Connected") {
+                console.warn("Call connection timeout, retrying queue...");
+                isMatchmakingActiveRef.current = false;
+                searchForStranger();
               }
-            }
-          } catch (e) {
-            console.warn("Poll notice:", e);
+            }, 8000);
           }
-        }, 2000);
+        }, 600);
+
+        isMatchmakingActiveRef.current = false;
+      } else {
+        // CASE B: Current user is WAITING in queue as RECEIVER
+        if (queueListenerUnsubRef.current) {
+          queueListenerUnsubRef.current();
+        }
+
+        queueListenerUnsubRef.current = listenForIncomingMatch(uid, (incomingMatch) => {
+          if (incomingMatch.matched && incomingMatch.matchId) {
+            currentMatchIdRef.current = incomingMatch.matchId;
+            setConnectedPeerId(incomingMatch.remotePeerId);
+
+            // Listen to active match document so if initiator aborts, receiver is notified
+            if (matchListenerUnsubRef.current) {
+              matchListenerUnsubRef.current();
+            }
+            matchListenerUnsubRef.current = listenToActiveMatch(incomingMatch.matchId, () => {
+              handleStrangerDisconnected();
+            });
+
+            // Receiver will answer incoming call on peer.on("call")
+            isMatchmakingActiveRef.current = false;
+          }
+        });
+
+        isMatchmakingActiveRef.current = false;
       }
-    } catch (e) {
-      console.warn("Matchmaking API notice:", e);
+    } catch (err) {
+      console.error("Matchmaking error:", err);
+      isMatchmakingActiveRef.current = false;
+      setStatus("Stranger Disconnected");
     }
-  }, [attachCallEvents, closeCurrentCall, stopPolling]);
+  }, [attachCallEvents, closeCurrentCall, getUserId, handleStrangerDisconnected, status]);
 
   // SINGLE MOUNT EFFECT: Empty dependency array []
-  // Runs getUserMedia and initializes PeerJS once on component mount
+  // Initializes camera/mic and PeerJS once on component mount
   useEffect(() => {
-    let channel: BroadcastChannel | null = null;
     let localStream: MediaStream | null = null;
     let peerInstance: Peer | null = null;
 
     const init = async () => {
-      // 1. Camera & Microphone Initialization
+      // 1. Hardware Camera & Microphone Initialization
       try {
         if (!navigator?.mediaDevices?.getUserMedia) {
           setStatus("Hardware Error");
-          setErrorMessage("Browser does not support mediaDevices.getUserMedia.");
+          setErrorMessage("Your browser does not support WebRTC mediaDevices.");
           return;
         }
 
-        // Try video + audio first, fall back to video only if no microphone is found
+        // Try video + audio first, fall back to video-only if no microphone is found
         try {
           localStream = await navigator.mediaDevices.getUserMedia({
-            video: true,
+            video: {
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+              facingMode: "user",
+            },
             audio: true,
           });
         } catch (initialErr: unknown) {
@@ -218,7 +282,7 @@ export default function CyberVideoChat({ onLeave }: CyberVideoChatProps) {
           localVideoRef.current.play().catch(() => {});
         }
 
-        setStatus("Searching for Stranger...");
+        setStatus("Looking for a stranger...");
       } catch (err: unknown) {
         const error = err as { name?: string; message?: string };
         console.error("Camera/Mic initialization error:", err);
@@ -226,22 +290,22 @@ export default function CyberVideoChat({ onLeave }: CyberVideoChatProps) {
         if (error.name === "NotAllowedError" || error.name === "PermissionDeniedError") {
           setStatus("Permission Denied");
           setErrorMessage(
-            "Camera & Microphone access was denied. Please allow permissions in your browser bar."
+            "Camera and Microphone access was denied. Please allow permissions in your browser URL bar."
           );
         } else if (error.name === "NotFoundError" || error.name === "DevicesNotFoundError") {
           setStatus("Hardware Error");
-          setErrorMessage("No camera hardware detected on this computer.");
+          setErrorMessage("No webcam detected on this device.");
         } else if (error.name === "NotReadableError" || error.name === "TrackStartError") {
           setStatus("Hardware Error");
-          setErrorMessage("Camera is currently in use by another app or browser tab.");
+          setErrorMessage("Camera is currently in use by another application or browser tab.");
         } else {
           setStatus("Hardware Error");
-          setErrorMessage(error.message || "Failed to access media hardware.");
+          setErrorMessage(error.message || "Failed to access webcam hardware.");
         }
         return;
       }
 
-      // 2. PeerJS Initialization
+      // 2. PeerJS P2P Signaling Initialization
       try {
         const { Peer } = await import("peerjs");
         const randomId = `bites-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 7)}`;
@@ -250,53 +314,32 @@ export default function CyberVideoChat({ onLeave }: CyberVideoChatProps) {
         peerInstance = new Peer(randomId, {
           debug: 1,
           config: {
-            iceServers: [
-              { urls: "stun:stun.l.google.com:19302" },
-              { urls: "stun:stun1.l.google.com:19302" },
-              { urls: "stun:stun2.l.google.com:19302" },
-              { urls: "stun:stun.cloudflare.com:3478" },
-            ],
+            iceServers: ICE_SERVERS,
           },
         });
         peerRef.current = peerInstance;
-
-        // BroadcastChannel for instant same-machine testing
-        if (typeof window !== "undefined" && "BroadcastChannel" in window) {
-          channel = new BroadcastChannel("bites_matchmaking");
-          broadcastChannelRef.current = channel;
-
-          channel.onmessage = (event) => {
-            const msg = event.data;
-            if (!msg || !localStreamRef.current || !peerRef.current) return;
-
-            if (msg.type === "WAITING" && msg.peerId !== myPeerIdRef.current && !currentCallRef.current) {
-              const call = peerRef.current.call(msg.peerId, localStreamRef.current);
-              if (call) {
-                attachCallEvents(call, msg.peerId);
-                channel?.postMessage({
-                  type: "MATCH_CONFIRMED",
-                  callerId: myPeerIdRef.current,
-                  targetId: msg.peerId,
-                });
-              }
-            }
-          };
-        }
 
         // When Peer is connected to signaling server
         peerInstance.on("open", () => {
           searchForStranger();
         });
 
-        // Answer incoming media calls automatically with localStreamRef.current
+        // Answer incoming calls automatically with localStreamRef.current
         peerInstance.on("call", (incomingCall: MediaConnection) => {
           if (!localStreamRef.current) return;
           incomingCall.answer(localStreamRef.current);
-          attachCallEvents(incomingCall, incomingCall.peer);
+          attachCallEvents(
+            incomingCall,
+            incomingCall.peer,
+            currentMatchIdRef.current || `match_${incomingCall.peer}`
+          );
         });
 
         peerInstance.on("error", (err) => {
           console.warn("PeerJS subsystem error:", err);
+          if (err.type === "peer-unavailable") {
+            handleStrangerDisconnected();
+          }
         });
       } catch (peerErr) {
         console.error("PeerJS initialization error:", peerErr);
@@ -305,11 +348,37 @@ export default function CyberVideoChat({ onLeave }: CyberVideoChatProps) {
 
     init();
 
-    // CLEANUP ON UNMOUNT: Release all media tracks and destroy peer
-    return () => {
-      stopPolling();
+    // Keydown handler for classic Omegle Esc key behavior
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        handleNext();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
 
-      // Stop all camera and microphone hardware tracks
+    // CLEANUP ON UNMOUNT: Release all media tracks, queue tickets, and destroy peer
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+
+      if (callTimeoutRef.current) {
+        clearTimeout(callTimeoutRef.current);
+      }
+      if (queueListenerUnsubRef.current) {
+        queueListenerUnsubRef.current();
+      }
+      if (matchListenerUnsubRef.current) {
+        matchListenerUnsubRef.current();
+      }
+
+      // Leave queue and end match in Firestore
+      const { uid } = getUserId();
+      leaveMatchQueue(uid).catch(() => {});
+      if (currentMatchIdRef.current) {
+        endMatchSession(currentMatchIdRef.current).catch(() => {});
+      }
+
+      // Stop all camera and microphone hardware tracks safely
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach((track) => track.stop());
         localStreamRef.current = null;
@@ -323,27 +392,15 @@ export default function CyberVideoChat({ onLeave }: CyberVideoChatProps) {
         currentCallRef.current = null;
       }
 
-      // Close BroadcastChannel
-      if (channel) {
-        channel.close();
-      }
-
-      // Remove from server queue
-      if (myPeerIdRef.current) {
-        fetch(`/api/match?peerId=${encodeURIComponent(myPeerIdRef.current)}`, {
-          method: "DELETE",
-        }).catch(() => {});
-      }
-
       // Destroy PeerJS instance
       if (peerInstance) {
         peerInstance.destroy();
         peerRef.current = null;
       }
     };
-  }, []); // Strictly empty dependency array [] as requested
+  }, []); // Strictly empty dependency array []
 
-  // CONTROLS: Toggle Microphone
+  // CONTROLS: Toggle Microphone via track.enabled
   const toggleMic = () => {
     if (!localStreamRef.current) return;
     const audioTracks = localStreamRef.current.getAudioTracks();
@@ -355,7 +412,7 @@ export default function CyberVideoChat({ onLeave }: CyberVideoChatProps) {
     setMicEnabled(nextState);
   };
 
-  // CONTROLS: Toggle Camera Video
+  // CONTROLS: Toggle Camera Video via track.enabled
   const toggleVideo = () => {
     if (!localStreamRef.current) return;
     const videoTracks = localStreamRef.current.getVideoTracks();
@@ -367,107 +424,123 @@ export default function CyberVideoChat({ onLeave }: CyberVideoChatProps) {
     setVideoEnabled(nextState);
   };
 
-  // CONTROLS: Next / Skip Button
+  // CONTROLS: Classic Next / Skip Button
   const handleNext = () => {
+    setStopConfirm(false);
+    isMatchmakingActiveRef.current = false;
     closeCurrentCall();
     searchForStranger();
   };
 
-  return (
-    <div className="relative min-h-screen w-full bg-[#0a0a0a] text-zinc-100 font-sans overflow-hidden flex flex-col justify-between selection:bg-emerald-500/30 selection:text-emerald-200">
-      {/* Ambient Cyber Backdrops */}
-      <div className="fixed inset-0 pointer-events-none z-0 overflow-hidden">
-        <div className="absolute -top-40 -left-40 w-[600px] h-[600px] bg-emerald-500/10 rounded-full blur-[160px]" />
-        <div className="absolute -bottom-40 -right-40 w-[600px] h-[600px] bg-cyan-500/10 rounded-full blur-[160px]" />
-        <div className="absolute inset-0 bg-[linear-gradient(to_right,#00ff8808_1px,transparent_1px),linear-gradient(to_bottom,#00ff8808_1px,transparent_1px)] bg-[size:3rem_3rem] [mask-image:radial-gradient(ellipse_60%_50%_at_50%_50%,#000_70%,transparent_100%)]" />
-      </div>
+  // CONTROLS: Stop / Really? Two-step confirmation (classic Omegle style)
+  const handleStop = () => {
+    if (!stopConfirm) {
+      setStopConfirm(true);
+    } else {
+      // Confirmed exit
+      if (onLeave) {
+        onLeave();
+      } else if (typeof window !== "undefined") {
+        window.location.href = "/dashboard";
+      }
+    }
+  };
 
-      {/* Cyberpunk Top Bar */}
-      <header className="relative z-20 w-full px-6 py-4 flex items-center justify-between border-b border-emerald-500/20 backdrop-blur-2xl bg-[#0a0a0a]/70">
+  // CONTROLS: Report Stranger
+  const handleReport = () => {
+    setReported(true);
+    handleNext();
+  };
+
+  // CONTROLS: Like stranger
+  const handleLike = () => {
+    setLiked((prev) => !prev);
+  };
+
+  return (
+    <div className="relative h-screen w-full bg-[#0a0a0a] text-zinc-100 font-sans flex flex-col justify-between overflow-hidden select-none">
+      {/* Top Header Bar */}
+      <header className="h-14 px-4 sm:px-6 flex items-center justify-between border-b border-zinc-800/80 bg-[#0c0c0c] z-30">
         <div className="flex items-center gap-3">
-          <div className="h-9 w-9 rounded-lg bg-zinc-900 border border-emerald-400/40 flex items-center justify-center shadow-[0_0_15px_rgba(16,185,129,0.3)]">
+          <div className="flex items-center gap-1.5 font-black text-xl tracking-tight text-white">
             <Zap className="w-5 h-5 text-emerald-400 fill-emerald-400" />
+            <span>bites<span className="text-emerald-400">.</span></span>
           </div>
-          <div>
-            <div className="flex items-center gap-2">
-              <span className="font-mono font-black tracking-wider text-lg text-white">
-                BITES<span className="text-emerald-400">.CYBER</span>
-              </span>
-              <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 uppercase tracking-widest">
-                PeerJS P2P
-              </span>
-            </div>
-          </div>
+          <span className="text-[11px] font-mono tracking-widest uppercase px-2 py-0.5 rounded bg-zinc-800 text-zinc-300 border border-zinc-700 hidden sm:inline-block">
+            1-on-1 Video
+          </span>
         </div>
 
-        {/* Live Status Badge */}
-        <div className="flex items-center gap-3 font-mono text-xs">
+        {/* Real-time Status Banner */}
+        <div className="flex items-center gap-2 text-xs font-mono">
           <div
-            className={`flex items-center gap-2 px-3 py-1.5 rounded-md border backdrop-blur-md shadow-md transition-all ${
+            className={`flex items-center gap-2 px-3 py-1 rounded-full border transition-all ${
               status === "Connected"
-                ? "bg-emerald-950/60 border-emerald-400/60 text-emerald-300 shadow-[0_0_15px_rgba(16,185,129,0.25)]"
-                : status === "Searching for Stranger..."
-                ? "bg-cyan-950/60 border-cyan-400/60 text-cyan-300 shadow-[0_0_15px_rgba(6,182,212,0.25)]"
+                ? "bg-emerald-950/60 border-emerald-500/50 text-emerald-300"
+                : status === "Looking for a stranger..."
+                ? "bg-cyan-950/60 border-cyan-500/50 text-cyan-300 animate-pulse"
                 : status === "Stranger Disconnected"
-                ? "bg-amber-950/60 border-amber-400/60 text-amber-300"
+                ? "bg-amber-950/60 border-amber-500/50 text-amber-300"
                 : "bg-red-950/60 border-red-500/50 text-red-300"
             }`}
           >
             <span
               className={`w-2 h-2 rounded-full ${
                 status === "Connected"
-                  ? "bg-emerald-400 animate-pulse"
-                  : status === "Searching for Stranger..."
+                  ? "bg-emerald-400"
+                  : status === "Looking for a stranger..."
                   ? "bg-cyan-400 animate-ping"
                   : status === "Stranger Disconnected"
                   ? "bg-amber-400"
                   : "bg-red-500"
               }`}
             />
-            <span className="font-bold tracking-wide">{status}</span>
+            <span className="font-semibold">{status}</span>
           </div>
-
-          {onLeave && (
-            <button
-              onClick={onLeave}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-zinc-900/80 hover:bg-zinc-800 border border-zinc-700 text-zinc-300 hover:text-white transition-all text-xs cursor-pointer"
-            >
-              <PhoneOff className="w-3.5 h-3.5 text-red-400" />
-              <span>Leave</span>
-            </button>
-          )}
         </div>
       </header>
 
-      {/* Main Content Area */}
-      <main className="relative z-10 flex-1 w-full max-w-7xl mx-auto p-4 md:p-6 flex flex-col justify-center">
-        {/* Permission Denied / Hardware Error Banner */}
+      {/* Main Split-Screen Video Container */}
+      <main className="flex-1 w-full max-w-[1600px] mx-auto p-2 sm:p-4 flex flex-col justify-center min-h-0">
+        {/* Permission / Hardware Error Notice */}
         {errorMessage && (
-          <div className="mb-6 p-4 rounded-xl bg-red-950/50 border border-red-500/50 text-red-200 font-mono text-xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 backdrop-blur-xl shadow-[0_0_25px_rgba(239,68,68,0.25)]">
-            <div className="flex items-center gap-3">
-              <ShieldAlert className="w-5 h-5 text-red-400 shrink-0" />
+          <div className="mb-2 p-3 rounded-lg bg-red-950/70 border border-red-500/50 text-red-200 text-xs font-mono flex items-center justify-between gap-3 shrink-0">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
               <span>{errorMessage}</span>
             </div>
             <button
               onClick={() => window.location.reload()}
-              className="px-4 py-2 rounded-lg bg-red-500/20 hover:bg-red-500/30 border border-red-400/50 text-red-200 transition-all cursor-pointer font-bold tracking-wider"
+              className="px-3 py-1 bg-red-500/30 hover:bg-red-500/40 rounded border border-red-400/50 text-xs font-bold uppercase cursor-pointer"
             >
-              RELOAD & RETRY
+              Retry
             </button>
           </div>
         )}
 
-        {/* Video Canvas Viewport Grid */}
-        <div className="relative w-full h-[62vh] md:h-[68vh] rounded-2xl bg-zinc-950/90 border border-emerald-500/30 shadow-[0_0_40px_rgba(16,185,129,0.15)] overflow-hidden backdrop-blur-2xl flex items-center justify-center">
-          {/* Cyberpunk HUD Corner Brackets */}
-          <div className="absolute top-3 left-3 w-4 h-4 border-t-2 border-l-2 border-emerald-400 pointer-events-none z-20" />
-          <div className="absolute top-3 right-3 w-4 h-4 border-t-2 border-r-2 border-emerald-400 pointer-events-none z-20" />
-          <div className="absolute bottom-3 left-3 w-4 h-4 border-b-2 border-l-2 border-emerald-400 pointer-events-none z-20" />
-          <div className="absolute bottom-3 right-3 w-4 h-4 border-b-2 border-r-2 border-emerald-400 pointer-events-none z-20" />
+        {/* CLASSIC OMEGLE 2-PANEL SPLIT SCREEN: Side-by-Side Desktop, Stacked Mobile */}
+        <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-2 sm:gap-4 w-full h-full min-h-0">
+          {/* PANEL 1 (PRIMARY): Stranger's Video */}
+          <div className="relative w-full h-full rounded-xl bg-black border border-zinc-800 overflow-hidden flex items-center justify-center shadow-lg">
+            {/* Header Tag */}
+            <div className="absolute top-3 left-3 z-20 flex items-center gap-1.5 px-2.5 py-1 rounded bg-black/75 border border-zinc-700/80 backdrop-blur-md text-xs font-mono font-bold text-cyan-300 pointer-events-none">
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  status === "Connected" ? "bg-cyan-400" : "bg-zinc-600"
+                }`}
+              />
+              <span>Stranger</span>
+            </div>
 
-          {/* 1. Large Main View: Remote Stranger's Video Canvas */}
-          <div className="w-full h-full relative flex items-center justify-center bg-black">
-            {/* Real Remote Video Element - ALWAYS rendered to allow continuous decoding */}
+            {/* Like Badge Indicator */}
+            {liked && status === "Connected" && (
+              <div className="absolute top-3 right-3 z-20 flex items-center gap-1 px-2.5 py-1 rounded bg-rose-500/20 border border-rose-500/40 text-rose-300 text-xs font-mono animate-bounce">
+                <Heart className="w-3.5 h-3.5 fill-rose-400 text-rose-400" />
+                <span>Liked</span>
+              </div>
+            )}
+
+            {/* Remote Video Element */}
             <video
               ref={remoteVideoRef}
               autoPlay
@@ -477,80 +550,85 @@ export default function CyberVideoChat({ onLeave }: CyberVideoChatProps) {
               }`}
             />
 
-            {/* Overlays when not connected */}
-            {status === "Searching for Stranger..." && (
-              <div className="flex flex-col items-center gap-4 text-center px-4">
-                <div className="relative w-20 h-20 flex items-center justify-center">
-                  <div className="absolute inset-0 rounded-full border-2 border-cyan-400/30 animate-ping" />
-                  <div className="w-16 h-16 rounded-full border-2 border-cyan-400 border-t-transparent animate-spin flex items-center justify-center">
-                    <Radio className="w-6 h-6 text-cyan-400" />
-                  </div>
+            {/* Placeholder: Looking for a Stranger */}
+            {status === "Looking for a stranger..." && (
+              <div className="flex flex-col items-center gap-3 text-center px-4 font-mono">
+                <div className="relative w-14 h-14 flex items-center justify-center">
+                  <div className="absolute inset-0 rounded-full border border-cyan-400/40 animate-ping" />
+                  <Loader2 className="w-8 h-8 text-cyan-400 animate-spin" />
                 </div>
-                <div>
-                  <p className="text-cyan-400 font-mono text-sm tracking-widest uppercase font-bold">
-                    SEARCHING FOR STRANGER...
+                <div className="space-y-1">
+                  <p className="text-cyan-300 font-bold text-sm tracking-wide">
+                    LOOKING FOR A STRANGER...
                   </p>
-                  <p className="text-zinc-500 font-mono text-xs mt-1">
-                    Matching random peer on encrypted WebRTC channel
+                  <p className="text-zinc-500 text-xs">
+                    Searching live queue • Press <kbd className="px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-300">Esc</kbd> to skip
                   </p>
                 </div>
               </div>
             )}
 
+            {/* Placeholder: Stranger Disconnected */}
             {status === "Stranger Disconnected" && (
               <div className="flex flex-col items-center gap-3 text-center px-4 font-mono">
-                <div className="w-14 h-14 rounded-2xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-center text-amber-400">
-                  <VideoOff className="w-7 h-7" />
+                <div className="w-12 h-12 rounded-full bg-amber-500/10 border border-amber-500/30 flex items-center justify-center text-amber-400">
+                  <VideoOff className="w-6 h-6" />
                 </div>
-                <p className="text-amber-300 font-bold text-sm tracking-wide">
-                  STRANGER DISCONNECTED
-                </p>
-                <p className="text-zinc-500 text-xs max-w-xs">
-                  The peer has disconnected. Click &quot;NEXT (SKIP)&quot; to match with a new stranger.
+                <p className="text-amber-300 font-bold text-sm">
+                  STRANGER HAS DISCONNECTED
                 </p>
                 <button
                   onClick={handleNext}
-                  className="mt-2 px-5 py-2.5 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/40 text-amber-200 text-xs font-bold transition-all cursor-pointer shadow-md"
+                  className="mt-2 px-5 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-black text-xs font-bold tracking-wider uppercase transition-all cursor-pointer shadow-md"
                 >
-                  FIND NEXT STRANGER
+                  Find Next Stranger (Esc)
                 </button>
               </div>
             )}
 
+            {/* Placeholder: Initializing Camera */}
             {status === "Initializing Camera..." && (
-              <div className="flex flex-col items-center gap-3 text-zinc-400 font-mono text-xs">
-                <RefreshCw className="w-8 h-8 animate-spin text-emerald-400" />
-                <p>INITIALIZING CAMERA & MIC HARDWARE...</p>
+              <div className="flex flex-col items-center gap-2 text-zinc-400 font-mono text-xs">
+                <RefreshCw className="w-6 h-6 animate-spin text-emerald-400" />
+                <p>Initializing camera and microphone...</p>
               </div>
             )}
 
+            {/* Placeholder: Permission Denied */}
             {status === "Permission Denied" && (
-              <div className="flex flex-col items-center gap-3 text-center px-4 font-mono max-w-md">
-                <Camera className="w-12 h-12 text-red-400" />
-                <p className="text-red-300 font-bold text-sm">CAMERA PERMISSION REQUIRED</p>
-                <p className="text-zinc-400 text-xs">
-                  Please click the lock/camera icon in your browser address bar to grant camera and microphone access.
+              <div className="flex flex-col items-center gap-2 text-center px-4 font-mono">
+                <Camera className="w-8 h-8 text-red-400" />
+                <p className="text-red-300 font-bold text-xs">Camera Access Denied</p>
+                <p className="text-zinc-500 text-[11px] max-w-xs">
+                  Please enable camera permission in your browser to start video chatting.
                 </p>
               </div>
             )}
-
-            {/* Remote Feed HUD Watermark */}
-            <div className="absolute top-5 left-6 font-mono text-[11px] text-zinc-400 flex items-center gap-2 z-20 pointer-events-none">
-              <span
-                className={`w-2 h-2 rounded-full ${
-                  status === "Connected" ? "bg-emerald-400 animate-pulse" : "bg-zinc-600"
-                }`}
-              />
-              <span>
-                REMOTE_FEED //{" "}
-                {connectedPeerId ? `PEER:${connectedPeerId.slice(-6)}` : "STRANGER"}
-              </span>
-            </div>
           </div>
 
-          {/* 1. Smaller PiP (Picture-in-Picture) for Local User Stream */}
-          <div className="absolute bottom-5 right-5 z-30 w-36 h-28 sm:w-52 sm:h-36 md:w-64 md:h-44 rounded-xl overflow-hidden bg-black/90 border-2 border-emerald-400/60 shadow-[0_0_25px_rgba(16,185,129,0.35)] backdrop-blur-xl group transition-all duration-300">
-            {/* Local Video Stream Element */}
+          {/* PANEL 2: You (Local Camera Feed) */}
+          <div className="relative w-full h-full rounded-xl bg-black border border-zinc-800 overflow-hidden flex items-center justify-center shadow-lg">
+            {/* Header Tag */}
+            <div className="absolute top-3 left-3 z-20 flex items-center gap-1.5 px-2.5 py-1 rounded bg-black/75 border border-zinc-700/80 backdrop-blur-md text-xs font-mono font-bold text-emerald-300 pointer-events-none">
+              <span className="w-2 h-2 rounded-full bg-emerald-400" />
+              <span>You</span>
+            </div>
+
+            {/* Muted/Off Status Indicator */}
+            <div className="absolute top-3 right-3 z-20 flex items-center gap-1.5 font-mono text-[11px] pointer-events-none">
+              {!micEnabled && (
+                <span className="px-2 py-0.5 rounded bg-red-950/80 text-red-300 border border-red-500/40">
+                  MUTED
+                </span>
+              )}
+              {!videoEnabled && (
+                <span className="px-2 py-0.5 rounded bg-red-950/80 text-red-300 border border-red-500/40">
+                  CAM OFF
+                </span>
+              )}
+            </div>
+
+            {/* Local Video Element (mirrored) */}
             <video
               ref={localVideoRef}
               autoPlay
@@ -561,85 +639,116 @@ export default function CyberVideoChat({ onLeave }: CyberVideoChatProps) {
               }`}
             />
 
-            {/* Video Paused Placeholder */}
+            {/* Camera Muted Placeholder */}
             {!videoEnabled && (
-              <div className="w-full h-full flex flex-col items-center justify-center bg-zinc-950 font-mono text-[10px] text-zinc-500">
-                <VideoOff className="w-6 h-6 mb-1 text-zinc-600" />
-                <span>VIDEO MUTED</span>
+              <div className="flex flex-col items-center gap-2 text-zinc-500 font-mono text-xs">
+                <VideoOff className="w-8 h-8 text-zinc-600" />
+                <span>YOUR CAMERA IS PAUSED</span>
               </div>
             )}
-
-            {/* PiP HUD Status Bar */}
-            <div className="absolute bottom-2 left-2 right-2 flex items-center justify-between font-mono text-[9px] text-emerald-300 bg-black/70 px-2 py-1 rounded backdrop-blur-sm pointer-events-none">
-              <span className="truncate">YOU (LOCAL)</span>
-              <span>{!micEnabled ? "MIC:OFF" : "LIVE"}</span>
-            </div>
           </div>
         </div>
       </main>
 
-      {/* Control Dock */}
-      <footer className="relative z-20 w-full max-w-4xl mx-auto px-4 pb-6 pt-2">
-        <div className="p-3 sm:p-4 rounded-2xl bg-zinc-950/70 border border-emerald-500/30 backdrop-blur-2xl shadow-[0_0_35px_rgba(16,185,129,0.15)] flex flex-wrap items-center justify-between gap-3">
-          {/* Audio / Video Controls */}
-          <div className="flex items-center gap-2 sm:gap-3">
-            {/* Mute / Unmute Mic Button */}
-            <button
-              onClick={toggleMic}
-              className={`flex items-center gap-2 px-3.5 sm:px-4 py-2.5 rounded-xl font-mono text-xs font-semibold tracking-wider transition-all duration-200 cursor-pointer border ${
-                micEnabled
-                  ? "bg-zinc-900/90 text-emerald-300 border-emerald-500/40 hover:bg-emerald-500/20 hover:border-emerald-400 shadow-[0_0_15px_rgba(16,185,129,0.15)]"
-                  : "bg-red-950/50 text-red-300 border-red-500/50 hover:bg-red-900/50 shadow-[0_0_15px_rgba(239,68,68,0.2)]"
-              }`}
-              title={micEnabled ? "Mute Microphone" : "Unmute Microphone"}
-            >
-              {micEnabled ? (
-                <Mic className="w-4 h-4 text-emerald-400" />
-              ) : (
-                <MicOff className="w-4 h-4 text-red-400" />
-              )}
-              <span className="hidden sm:inline">{micEnabled ? "MUTE MIC" : "UNMUTE"}</span>
-            </button>
+      {/* Classic Omegle Bottom Control Dock */}
+      <footer className="h-20 px-4 sm:px-6 bg-[#0c0c0c] border-t border-zinc-800 flex items-center justify-between gap-2 sm:gap-4 z-30">
+        {/* Left Section: Stop / Really? */}
+        <div className="flex items-center gap-2">
+          <button
+            onClick={handleStop}
+            className={`px-4 sm:px-6 py-2.5 rounded-lg font-mono text-xs sm:text-sm font-bold tracking-wider uppercase transition-all cursor-pointer border ${
+              stopConfirm
+                ? "bg-red-600 text-white border-red-500 animate-pulse"
+                : "bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border-zinc-700"
+            }`}
+          >
+            {stopConfirm ? "Really? (Exit)" : "Stop"}
+          </button>
 
-            {/* Stop / Start Video Button */}
+          {stopConfirm && (
             <button
-              onClick={toggleVideo}
-              className={`flex items-center gap-2 px-3.5 sm:px-4 py-2.5 rounded-xl font-mono text-xs font-semibold tracking-wider transition-all duration-200 cursor-pointer border ${
-                videoEnabled
-                  ? "bg-zinc-900/90 text-emerald-300 border-emerald-500/40 hover:bg-emerald-500/20 hover:border-emerald-400 shadow-[0_0_15px_rgba(16,185,129,0.15)]"
-                  : "bg-red-950/50 text-red-300 border-red-500/50 hover:bg-red-900/50 shadow-[0_0_15px_rgba(239,68,68,0.2)]"
-              }`}
-              title={videoEnabled ? "Stop Video Feed" : "Start Video Feed"}
+              onClick={() => setStopConfirm(false)}
+              className="px-3 py-2.5 rounded-lg bg-zinc-800 text-zinc-400 hover:text-white text-xs font-mono"
             >
-              {videoEnabled ? (
-                <VideoIcon className="w-4 h-4 text-emerald-400" />
-              ) : (
-                <VideoOff className="w-4 h-4 text-red-400" />
-              )}
-              <span className="hidden sm:inline">{videoEnabled ? "STOP VIDEO" : "START VIDEO"}</span>
+              Cancel
             </button>
-          </div>
+          )}
+        </div>
 
-          {/* Prominent Next (Skip) Button */}
-          <div className="flex items-center gap-2">
+        {/* Center Section: Prominent NEXT (ESC) Button */}
+        <div className="flex-1 flex justify-center max-w-sm mx-2">
+          <button
+            onClick={handleNext}
+            className="w-full py-2.5 sm:py-3 px-6 rounded-lg font-mono text-xs sm:text-sm font-black tracking-wider uppercase transition-all duration-150 cursor-pointer bg-gradient-to-r from-emerald-500 to-cyan-500 hover:from-emerald-400 hover:to-cyan-400 text-black shadow-md active:scale-95 flex items-center justify-center gap-2"
+          >
+            {status === "Looking for a stranger..." ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin text-black" />
+                <span>Skip (Esc)</span>
+              </>
+            ) : (
+              <>
+                <SkipForward className="w-4 h-4 fill-black text-black" />
+                <span>Next Stranger (Esc)</span>
+              </>
+            )}
+          </button>
+        </div>
+
+        {/* Right Section: Media Toggles & Actions */}
+        <div className="flex items-center gap-1.5 sm:gap-2">
+          {/* Like Button */}
+          {status === "Connected" && (
             <button
-              onClick={handleNext}
-              disabled={status === "Searching for Stranger..."}
-              className="flex items-center gap-2.5 px-6 sm:px-8 py-2.5 sm:py-3 rounded-xl font-mono text-xs sm:text-sm font-black tracking-wider uppercase transition-all duration-300 cursor-pointer bg-gradient-to-r from-emerald-500 to-cyan-500 hover:from-emerald-400 hover:to-cyan-400 text-black shadow-[0_0_25px_rgba(16,185,129,0.4)] hover:shadow-[0_0_35px_rgba(6,182,212,0.6)] active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed"
+              onClick={handleLike}
+              className={`p-2.5 rounded-lg border transition-all cursor-pointer ${
+                liked
+                  ? "bg-rose-500/20 text-rose-300 border-rose-500/40"
+                  : "bg-zinc-800/80 text-zinc-400 border-zinc-700 hover:text-rose-300"
+              }`}
+              title="Like Stranger"
             >
-              {status === "Searching for Stranger..." ? (
-                <>
-                  <RefreshCw className="w-4 h-4 animate-spin text-black" />
-                  <span>SEARCHING...</span>
-                </>
-              ) : (
-                <>
-                  <SkipForward className="w-4 h-4 fill-black text-black" />
-                  <span>NEXT (SKIP)</span>
-                </>
-              )}
+              <Heart className={`w-4 h-4 ${liked ? "fill-rose-400 text-rose-400" : ""}`} />
             </button>
-          </div>
+          )}
+
+          {/* Report Button */}
+          {status === "Connected" && (
+            <button
+              onClick={handleReport}
+              disabled={reported}
+              className="p-2.5 rounded-lg bg-zinc-800/80 hover:bg-zinc-700 text-zinc-400 hover:text-red-400 border border-zinc-700 transition-all cursor-pointer disabled:opacity-50"
+              title="Report & Skip"
+            >
+              <Flag className="w-4 h-4" />
+            </button>
+          )}
+
+          {/* Mic Toggle */}
+          <button
+            onClick={toggleMic}
+            className={`p-2.5 rounded-lg border transition-all cursor-pointer ${
+              micEnabled
+                ? "bg-zinc-800 hover:bg-zinc-700 text-emerald-400 border-zinc-700"
+                : "bg-red-950 text-red-400 border-red-500/50"
+            }`}
+            title={micEnabled ? "Mute Microphone" : "Unmute Microphone"}
+          >
+            {micEnabled ? <Mic className="w-4 h-4" /> : <MicOff className="w-4 h-4" />}
+          </button>
+
+          {/* Camera Toggle */}
+          <button
+            onClick={toggleVideo}
+            className={`p-2.5 rounded-lg border transition-all cursor-pointer ${
+              videoEnabled
+                ? "bg-zinc-800 hover:bg-zinc-700 text-emerald-400 border-zinc-700"
+                : "bg-red-950 text-red-400 border-red-500/50"
+            }`}
+            title={videoEnabled ? "Turn Off Camera" : "Turn On Camera"}
+          >
+            {videoEnabled ? <VideoIcon className="w-4 h-4" /> : <VideoOff className="w-4 h-4" />}
+          </button>
         </div>
       </footer>
     </div>

@@ -53,10 +53,10 @@ export default function AuthPage() {
     return () => unsubscribe();
   }, [router]);
 
-  // Strict validation: must end with @thapar.edu
-  const validateThaparEmail = (emailStr: string): boolean => {
+  // Validation: accept any valid @gmail.com address
+  const validateGmailEmail = (emailStr: string): boolean => {
     const trimmed = emailStr.trim().toLowerCase();
-    return trimmed.endsWith("@thapar.edu") && trimmed.length > "@thapar.edu".length;
+    return trimmed.endsWith("@gmail.com") && trimmed.length > "@gmail.com".length;
   };
 
   const handleAuth = async (e: React.FormEvent) => {
@@ -66,9 +66,9 @@ export default function AuthPage() {
 
     const cleanEmail = email.trim().toLowerCase();
 
-    // Strict validation check
-    if (!validateThaparEmail(cleanEmail)) {
-      setError("Registration restricted: Only official @thapar.edu email addresses are permitted.");
+    // Gmail validation check
+    if (!validateGmailEmail(cleanEmail)) {
+      setError("Only Gmail addresses (@gmail.com) are accepted. Please use your personal Google Gmail account.");
       return;
     }
 
@@ -125,7 +125,7 @@ export default function AuthPage() {
       const firebaseError = err as { code?: string; message?: string };
       switch (firebaseError.code) {
         case "auth/email-already-in-use":
-          setError("An account with this @thapar.edu email already exists. Please switch to Sign In.");
+          setError("An account with this Gmail address already exists. Please switch to Sign In.");
           break;
         case "auth/invalid-email":
           setError("Invalid email address format.");
@@ -151,7 +151,7 @@ export default function AuthPage() {
     try {
       setLoading(true);
       await sendEmailVerification(auth.currentUser);
-      setSuccessMessage("A fresh verification email has been dispatched to your @thapar.edu inbox.");
+      setSuccessMessage("A fresh verification email has been dispatched to your Gmail inbox.");
     } catch (err: unknown) {
       const firebaseError = err as { message?: string };
       setError(firebaseError.message || "Failed to resend verification email. Please try again later.");
@@ -182,14 +182,14 @@ export default function AuthPage() {
               bites<span className="text-emerald-400">.</span>
             </span>
             <span className="text-[10px] font-mono tracking-widest uppercase px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-300 border border-emerald-500/30">
-              Thapar Campus
+              Open for All
             </span>
           </div>
         </div>
 
         <div className="hidden sm:flex items-center gap-2 text-xs text-zinc-400 font-mono bg-zinc-900/60 backdrop-blur-md px-3.5 py-1.5 rounded-full border border-emerald-500/20 shadow-inner">
           <ShieldCheck className="w-4 h-4 text-emerald-400" />
-          <span>Restricted to <span className="text-emerald-300 font-semibold">@thapar.edu</span></span>
+          <span>Sign in with <span className="text-emerald-300 font-semibold">@gmail.com</span></span>
         </div>
       </header>
 
@@ -211,7 +211,7 @@ export default function AuthPage() {
           </h2>
 
           <p className="text-base sm:text-lg text-zinc-400 max-w-lg mx-auto leading-relaxed mb-5">
-            High-speed, peer-to-peer 1-on-1 video matching exclusively for verified Thapar University students.
+            High-speed, peer-to-peer 1-on-1 random video chat. Open for everyone — just sign in with your Gmail.
           </p>
 
           <div className="flex items-center justify-center gap-3">
@@ -290,10 +290,10 @@ export default function AuthPage() {
 
             {/* Auth Form */}
             <form onSubmit={handleAuth} className="space-y-4">
-              {/* College Email Input */}
+              {/* Gmail Email Input */}
               <div>
                 <label className="block text-xs font-mono font-medium text-zinc-300 mb-1.5">
-                  College Email (@thapar.edu) <span className="text-emerald-400">*</span>
+                  Gmail Address <span className="text-emerald-400">*</span>
                 </label>
                 <div className="relative">
                   <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-zinc-500">
@@ -304,12 +304,12 @@ export default function AuthPage() {
                     required
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
-                    placeholder="rollno@thapar.edu"
+                    placeholder="yourname@gmail.com"
                     className="w-full pl-10 pr-4 py-2.5 bg-black/40 border border-zinc-800 focus:border-emerald-400/80 rounded-xl text-sm text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-2 focus:ring-emerald-500/30 transition-all font-mono"
                   />
                 </div>
                 <p className="text-[11px] text-zinc-500 mt-1 flex items-center gap-1 font-mono">
-                  <span className="text-emerald-400 font-bold">@</span> Strictly requires <code className="text-zinc-300">@thapar.edu</code>
+                  <span className="text-emerald-400 font-bold">@</span> Must be a valid <code className="text-zinc-300">@gmail.com</code> address
                 </p>
               </div>
 
@@ -409,7 +409,7 @@ export default function AuthPage() {
 
       {/* Footer */}
       <footer className="relative z-10 w-full max-w-6xl mx-auto px-6 py-5 text-center text-xs font-mono text-zinc-600 border-t border-emerald-500/10">
-        &copy; {new Date().getFullYear()} Bites. Exclusive peer-to-peer 1-on-1 video dating for Thapar University.
+        &copy; {new Date().getFullYear()} Bites. Peer-to-peer 1-on-1 random video chat — open for everyone.
       </footer>
     </div>
   );

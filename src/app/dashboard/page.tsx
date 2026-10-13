@@ -144,30 +144,9 @@ export default function DashboardPage() {
     };
   }, [user, isVerified, router]);
 
-  // Handle Find your partner / Enter Queue
-  const handleEnterQueue = async () => {
-    if (!user) return;
-    setErrorNotice(null);
-    setStatusLoading(true);
-
-    try {
-      const userDocRef = doc(db, "users", user.uid);
-      await setDoc(
-        userDocRef,
-        {
-          status: "in-queue",
-          isVerified: true,
-          updatedAt: serverTimestamp(),
-        },
-        { merge: true }
-      );
-      setUserStatus("in-queue");
-    } catch (err: unknown) {
-      console.error("Error entering queue:", err);
-      setErrorNotice("Failed to enter matching queue. Please try again.");
-    } finally {
-      setStatusLoading(false);
-    }
+  // Handle Find your partner / Enter Queue -> Navigate directly to 1-on-1 video call room
+  const handleEnterQueue = () => {
+    router.push("/call");
   };
 
   // Handle Cancel Queue
@@ -354,10 +333,10 @@ export default function DashboardPage() {
               </div>
 
               <h2 className="text-2xl font-bold text-white tracking-tight mb-2">
-                Verify Your Thapar Email
+                Verify Your Email
               </h2>
               <p className="text-sm text-zinc-400 max-w-md mx-auto mb-6 leading-relaxed">
-                To keep the Bites dating pool safe and exclusive, speed dating requires a verified{" "}
+                To keep the Bites community safe and authentic, speed dating requires a verified{" "}
                 <span className="text-emerald-300 font-mono font-medium">{user?.email}</span> address.
               </p>
 
@@ -478,7 +457,7 @@ export default function DashboardPage() {
                     <Loader2 className="w-10 h-10 text-cyan-400 animate-spin mb-3" />
                     <span className="text-lg font-bold text-white tracking-tight">Searching...</span>
                     <span className="text-[11px] font-mono text-cyan-300 mt-1">
-                      Matching Thapar student
+                      Matching random partner
                     </span>
                   </div>
 
@@ -526,7 +505,7 @@ export default function DashboardPage() {
                 </div>
                 <h4 className="text-xs font-semibold text-zinc-200">100% Random</h4>
                 <p className="text-[11px] text-zinc-500 mt-0.5">
-                  Unbiased campus matchmaking across all verified participants.
+                  Unbiased video matchmaking across all verified participants.
                 </p>
               </div>
 
@@ -544,9 +523,9 @@ export default function DashboardPage() {
                 <div className="w-7 h-7 rounded-lg bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400 mb-2.5">
                   <ShieldCheck className="w-4 h-4" />
                 </div>
-                <h4 className="text-xs font-semibold text-zinc-200">Campus Exclusive</h4>
+                <h4 className="text-xs font-semibold text-zinc-200">Verified Community</h4>
                 <p className="text-[11px] text-zinc-500 mt-0.5">
-                  Every participant is verified with an official @thapar.edu ID.
+                  Open for all verified Google Gmail accounts.
                 </p>
               </div>
             </div>
@@ -556,7 +535,7 @@ export default function DashboardPage() {
 
       {/* Footer */}
       <footer className="relative z-10 w-full max-w-6xl mx-auto px-6 py-5 text-center text-xs font-mono text-zinc-600 border-t border-emerald-500/10">
-        &copy; {new Date().getFullYear()} Bites. Peer-to-peer 1-on-1 college speed dating for Thapar University.
+        &copy; {new Date().getFullYear()} Bites. Peer-to-peer 1-on-1 random video chat.
       </footer>
     </div>
   );
