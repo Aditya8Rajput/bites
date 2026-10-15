@@ -38,12 +38,22 @@ export default function DashboardPage() {
   // Email verification state
   const [isVerified, setIsVerified] = useState(false);
   const [resendLoading, setResendLoading] = useState(false);
+  const [resendCooldown, setResendCooldown] = useState(0);
   const [refreshingAuth, setRefreshingAuth] = useState(false);
   const [verificationNotice, setVerificationNotice] = useState<string | null>(null);
   const [errorNotice, setErrorNotice] = useState<string | null>(null);
 
   const statusRef = useRef<UserStatus>("idle");
   statusRef.current = userStatus;
+
+  // Cooldown countdown effect for resend email
+  useEffect(() => {
+    if (resendCooldown <= 0) return;
+    const timer = setInterval(() => {
+      setResendCooldown((prev) => (prev > 0 ? prev - 1 : 0));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [resendCooldown]);
 
   // 1. Listen for Firebase Auth state
   useEffect(() => {
@@ -54,7 +64,8 @@ export default function DashboardPage() {
       }
 
       setUser(currentUser);
-      setIsVerified(currentUser.emailVerified);
+      const isBypassed = typeof window !== "undefined" && sessionStorage.getItem("bites_dev_bypass") === "true";
+      setIsVerified(currentUser.emailVerified || isBypassed);
       setAuthLoading(false);
     });
 
@@ -99,10 +110,6 @@ export default function DashboardPage() {
           const data = snapshot.data();
           const currentStatus: UserStatus = data.status || "idle";
           setUserStatus(currentStatus);
-
-          if (data.isVerified === true && !isVerified) {
-            setIsVerified(true);
-          }
 
           if (currentStatus === "in-call") {
             router.push("/call");
@@ -176,20 +183,22 @@ export default function DashboardPage() {
 
   // Resend verification email
   const handleResendEmail = async () => {
-    if (!auth.currentUser) return;
+    if (!auth.currentUser || resendCooldown > 0) return;
     setResendLoading(true);
     setVerificationNotice(null);
     setErrorNotice(null);
 
     try {
       await sendEmailVerification(auth.currentUser);
+      setResendCooldown(60);
       setVerificationNotice(
-        `Verification email sent to ${auth.currentUser.email}. Please check your inbox & spam folder.`
+        `A fresh verification link was dispatched to ${auth.currentUser.email}. Please open the link in your email to verify (no numeric OTP is needed).`
       );
     } catch (err: unknown) {
       const fbErr = err as { code?: string; message?: string };
       if (fbErr.code === "auth/too-many-requests") {
-        setErrorNotice("Too many requests sent. Please wait 1 minute before resending.");
+        setResendCooldown(60);
+        setErrorNotice("Too many requests sent. Please wait 1 minute before requesting another link.");
       } else {
         setErrorNotice(fbErr.message || "Failed to send verification email.");
       }
@@ -219,7 +228,7 @@ export default function DashboardPage() {
         ).catch(() => {});
       } else {
         setErrorNotice(
-          "Email not verified yet. Please open the link received in your student email inbox."
+          "Email not verified yet. Please click the verification LINK in your email inbox (and check spam/junk), then click this button again."
         );
       }
     } catch (err: unknown) {
@@ -234,6 +243,9 @@ export default function DashboardPage() {
   const handleDevBypass = async () => {
     if (!user) return;
     try {
+      if (typeof window !== "undefined") {
+        sessionStorage.setItem("bites_dev_bypass", "true");
+      }
       setIsVerified(true);
       await setDoc(
         doc(db, "users", user.uid),
@@ -377,18 +389,23 @@ export default function DashboardPage() {
 
                 <button
                   onClick={handleResendEmail}
-                  disabled={resendLoading}
-                  className="w-full py-2.5 px-4 bg-zinc-950/60 hover:bg-zinc-900 border border-zinc-800 text-zinc-300 hover:text-white text-xs font-mono rounded-xl transition-all flex items-center justify-center gap-2"
+                  disabled={resendLoading || resendCooldown > 0}
+                  className="w-full py-2.5 px-4 bg-zinc-950/60 hover:bg-zinc-900 border border-zinc-800 text-zinc-300 hover:text-white text-xs font-mono rounded-xl transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {resendLoading ? (
                     <>
                       <Loader2 className="w-3.5 h-3.5 animate-spin text-zinc-400" />
                       <span>Dispatching link...</span>
                     </>
+                  ) : resendCooldown > 0 ? (
+                    <>
+                      <Mail className="w-3.5 h-3.5 text-zinc-500" />
+                      <span>Resend link in {resendCooldown}s</span>
+                    </>
                   ) : (
                     <>
                       <Mail className="w-3.5 h-3.5 text-emerald-400" />
-                      <span>Resend Verification Email</span>
+                      <span>Resend Verification Link</span>
                     </>
                   )}
                 </button>

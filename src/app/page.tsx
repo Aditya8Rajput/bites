@@ -39,6 +39,7 @@ export default function AuthPage() {
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [accountExists, setAccountExists] = useState(false);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [verificationPending, setVerificationPending] = useState(false);
   const isSubmittingRef = useRef(false);
@@ -62,6 +63,7 @@ export default function AuthPage() {
   const handleAuth = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setAccountExists(false);
     setSuccessMessage(null);
 
     const cleanEmail = email.trim().toLowerCase();
@@ -79,36 +81,45 @@ export default function AuthPage() {
 
     setLoading(true);
     isSubmittingRef.current = true;
+    console.log(`[Auth] Initiating ${mode} for:`, cleanEmail);
 
     try {
       if (mode === "signup") {
         // 1. Create user in Firebase Auth
         const userCredential = await createUserWithEmailAndPassword(auth, cleanEmail, password);
         const user = userCredential.user;
+        console.log("[Auth] User created successfully in Firebase Auth, UID:", user.uid);
 
         // 2. Send verification email
         try {
           await sendEmailVerification(user);
-        } catch (emailErr) {
-          console.warn("sendEmailVerification notice:", emailErr);
+          console.log("[Auth] Verification email dispatched to:", user.email);
+        } catch (emailErr: unknown) {
+          console.warn("[Auth] sendEmailVerification notice:", emailErr);
         }
 
-        // 3. Create initial user document in Firestore under users/{uid}
-        await setDoc(
-          doc(db, "users", user.uid),
-          {
-            uid: user.uid,
-            email: user.email || cleanEmail,
-            gender: gender,
-            isVerified: false,
-            status: "idle",
-            createdAt: serverTimestamp(),
-          },
-          { merge: true }
-        );
+        // 3. Create initial user document in Firestore under users/{uid} (isolated try/catch)
+        try {
+          await setDoc(
+            doc(db, "users", user.uid),
+            {
+              uid: user.uid,
+              email: user.email || cleanEmail,
+              gender: gender,
+              isVerified: false,
+              status: "idle",
+              createdAt: serverTimestamp(),
+            },
+            { merge: true }
+          );
+          console.log("[Auth] User profile document initialized in Firestore.");
+        } catch (profileErr: unknown) {
+          // If Firestore is still being provisioned, do not block the user's registration
+          console.warn("[Auth] Firestore profile init notice (will sync in dashboard):", profileErr);
+        }
 
         setVerificationPending(true);
-        setSuccessMessage("Verification link dispatched! Redirecting to campus dashboard...");
+        setSuccessMessage("Account created! A verification link was sent to your email. Redirecting to dashboard...");
 
         setTimeout(() => {
           isSubmittingRef.current = false;
@@ -116,30 +127,42 @@ export default function AuthPage() {
         }, 800);
       } else {
         // 1. Log in existing user
-        await signInWithEmailAndPassword(auth, cleanEmail, password);
+        const cred = await signInWithEmailAndPassword(auth, cleanEmail, password);
+        console.log("[Auth] Successfully logged in UID:", cred.user.uid);
         isSubmittingRef.current = false;
         router.push("/dashboard");
       }
     } catch (err: unknown) {
       isSubmittingRef.current = false;
       const firebaseError = err as { code?: string; message?: string };
+      console.error("[Auth] Error code:", firebaseError.code, "message:", firebaseError.message);
+
       switch (firebaseError.code) {
         case "auth/email-already-in-use":
-          setError("An account with this Gmail address already exists. Please switch to Sign In.");
+          setAccountExists(true);
+          setError("An account with this email address already exists.");
           break;
         case "auth/invalid-email":
-          setError("Invalid email address format.");
+          setError("Please enter a valid Gmail address format.");
+          break;
+        case "auth/weak-password":
+          setError("Password is too weak. Please use at least 6 characters.");
           break;
         case "auth/user-not-found":
+          setError("No account found with this email. Please check your spelling or switch to Sign Up.");
+          break;
         case "auth/wrong-password":
         case "auth/invalid-credential":
-          setError("Invalid credentials. Please verify your email and password.");
+          setError("Incorrect password or email. Please check your credentials and try again.");
           break;
         case "auth/too-many-requests":
-          setError("Too many consecutive attempts. Please wait a moment and try again.");
+          setError("Too many consecutive attempts. Please wait 1 minute before trying again.");
+          break;
+        case "auth/network-request-failed":
+          setError("Network connection issue. Please check your internet connection.");
           break;
         default:
-          setError(firebaseError.message || "Authentication error occurred. Please try again.");
+          setError(firebaseError.message || "An authentication error occurred. Please try again.");
       }
     } finally {
       setLoading(false);
@@ -266,7 +289,22 @@ export default function AuthPage() {
             {error && (
               <div className="mb-5 p-3.5 rounded-xl bg-red-500/10 border border-red-500/30 text-red-300 text-xs flex items-start gap-2.5 backdrop-blur-md">
                 <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-red-400" />
-                <span>{error}</span>
+                <div className="flex-1">
+                  <span>{error}</span>
+                  {accountExists && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setMode("login");
+                        setError(null);
+                        setAccountExists(false);
+                      }}
+                      className="mt-2 text-xs font-bold text-emerald-400 hover:text-emerald-300 underline block cursor-pointer"
+                    >
+                      Click here to Sign In with this email →
+                    </button>
+                  )}
+                </div>
               </div>
             )}
 

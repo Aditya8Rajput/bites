@@ -178,39 +178,49 @@ export default function CyberVideoChat({ onLeave, user: propUser }: CyberVideoCh
     const localStream = localStreamRef.current;
 
     try {
+      console.log(`[Matchmaking] User ${uid} searching for partner (peerId: ${myPeerId})...`);
       const matchResult = await findOrQueueMatch(uid, myPeerId, email);
+      console.log("[Matchmaking] Result:", matchResult);
 
       if (matchResult.matched && matchResult.role === "initiator" && matchResult.remotePeerId && matchResult.matchId) {
         // CASE A: Current user is the INITIATOR
         currentMatchIdRef.current = matchResult.matchId;
 
-        // Small delay to ensure receiver's PeerJS is ready to receive incoming offer
-        setTimeout(() => {
+        // Function to attempt call with retry
+        const makeCall = (attempt = 1) => {
           if (!peerRef.current || !localStreamRef.current) return;
+          console.log(`[WebRTC] Initiator calling receiver peer ${matchResult.remotePeerId} (attempt ${attempt})...`);
           const call = peerRef.current.call(matchResult.remotePeerId!, localStream);
           if (call) {
             attachCallEvents(call, matchResult.remotePeerId!, matchResult.matchId!);
 
-            // 8-second safety timeout if peer doesn't respond or ICE fails
+            // Timeout: if not connected within 4s, attempt 1 retry before giving up
             callTimeoutRef.current = setTimeout(() => {
-              if (status !== "Connected") {
-                console.warn("Call connection timeout, retrying queue...");
+              if (status !== "Connected" && attempt < 2) {
+                console.warn("[WebRTC] Call not answered yet, retrying once...");
+                makeCall(attempt + 1);
+              } else if (status !== "Connected") {
+                console.warn("[WebRTC] Call connection timeout, re-entering queue...");
                 isMatchmakingActiveRef.current = false;
                 searchForStranger();
               }
-            }, 8000);
+            }, 4000);
           }
-        }, 600);
+        };
 
+        // Small delay to ensure receiver's PeerJS is registered on signaling server
+        setTimeout(() => makeCall(1), 500);
         isMatchmakingActiveRef.current = false;
       } else {
         // CASE B: Current user is WAITING in queue as RECEIVER
+        console.log(`[Matchmaking] User ${uid} registered as waiting receiver. Listening for match...`);
         if (queueListenerUnsubRef.current) {
           queueListenerUnsubRef.current();
         }
 
         queueListenerUnsubRef.current = listenForIncomingMatch(uid, (incomingMatch) => {
           if (incomingMatch.matched && incomingMatch.matchId) {
+            console.log("[Matchmaking] Incoming match received via Firestore:", incomingMatch);
             currentMatchIdRef.current = incomingMatch.matchId;
             setConnectedPeerId(incomingMatch.remotePeerId);
 
@@ -229,10 +239,20 @@ export default function CyberVideoChat({ onLeave, user: propUser }: CyberVideoCh
 
         isMatchmakingActiveRef.current = false;
       }
-    } catch (err) {
-      console.error("Matchmaking error:", err);
+    } catch (err: unknown) {
+      const error = err as { code?: string; message?: string };
+      console.error("[Matchmaking] Queue error:", error);
       isMatchmakingActiveRef.current = false;
-      setStatus("Stranger Disconnected");
+
+      if (error?.code === "permission-denied") {
+        setStatus("Hardware Error");
+        setErrorMessage(
+          "Cloud Firestore permission denied. Please publish your firestore.rules in Firebase Console."
+        );
+      } else {
+        setErrorMessage(error?.message || "Failed to search matchmaking queue.");
+        setStatus("Stranger Disconnected");
+      }
     }
   }, [attachCallEvents, closeCurrentCall, getUserId, handleStrangerDisconnected, status]);
 
@@ -320,19 +340,41 @@ export default function CyberVideoChat({ onLeave, user: propUser }: CyberVideoCh
         peerRef.current = peerInstance;
 
         // When Peer is connected to signaling server
-        peerInstance.on("open", () => {
-          searchForStranger();
+        peerInstance.on("open", (openedId) => {
+          console.log("[PeerJS] Connected to signaling server with Peer ID:", openedId);
+          if (localStreamRef.current) {
+            searchForStranger();
+          } else {
+            console.log("[PeerJS] Waiting for local media stream before entering matchmaking queue...");
+            const mediaWaitInterval = setInterval(() => {
+              if (localStreamRef.current) {
+                clearInterval(mediaWaitInterval);
+                searchForStranger();
+              }
+            }, 300);
+          }
         });
 
         // Answer incoming calls automatically with localStreamRef.current
         peerInstance.on("call", (incomingCall: MediaConnection) => {
-          if (!localStreamRef.current) return;
-          incomingCall.answer(localStreamRef.current);
-          attachCallEvents(
-            incomingCall,
-            incomingCall.peer,
-            currentMatchIdRef.current || `match_${incomingCall.peer}`
-          );
+          console.log("[WebRTC] Incoming call received from remote peer:", incomingCall.peer);
+          const answer = () => {
+            if (localStreamRef.current) {
+              incomingCall.answer(localStreamRef.current);
+              attachCallEvents(
+                incomingCall,
+                incomingCall.peer,
+                currentMatchIdRef.current || `match_${incomingCall.peer}`
+              );
+            }
+          };
+
+          if (localStreamRef.current) {
+            answer();
+          } else {
+            console.warn("[WebRTC] Local stream not ready yet for incoming call, waiting...");
+            setTimeout(answer, 500);
+          }
         });
 
         peerInstance.on("error", (err) => {
@@ -426,7 +468,9 @@ export default function CyberVideoChat({ onLeave, user: propUser }: CyberVideoCh
 
   // CONTROLS: Classic Next / Skip Button
   const handleNext = () => {
+    console.log("[CyberVideoChat] Next clicked - resetting call and finding stranger...");
     setStopConfirm(false);
+    setErrorMessage(null);
     isMatchmakingActiveRef.current = false;
     closeCurrentCall();
     searchForStranger();

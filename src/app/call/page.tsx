@@ -14,12 +14,35 @@ export default function CallPage() {
   const [authChecking, setAuthChecking] = useState(true);
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      if (!currentUser) {
+        console.warn("[CallPage] Unauthenticated access attempt, redirecting to login.");
+        router.push("/?error=unauthorized");
+        return;
+      }
+
+      // Reload user from Firebase Auth to get authoritative emailVerified status
+      try {
+        await currentUser.reload();
+      } catch (err) {
+        console.warn("[CallPage] Notice reloading auth user:", err);
+      }
+
+      const isDevBypass = typeof window !== "undefined" && sessionStorage.getItem("bites_dev_bypass") === "true";
+      const isVerified = currentUser.emailVerified || isDevBypass;
+
+      if (!isVerified) {
+        console.warn("[CallPage] Unverified user attempted to enter matchmaking, redirecting to dashboard.");
+        router.push("/dashboard?notice=verify_required");
+        return;
+      }
+
       setUser(currentUser);
       setAuthChecking(false);
     });
+
     return () => unsubscribe();
-  }, []);
+  }, [router]);
 
   const handleLeave = async () => {
     if (user) {
@@ -46,7 +69,7 @@ export default function CallPage() {
         </div>
         <div className="flex items-center gap-2 text-xs">
           <Loader2 className="w-4 h-4 animate-spin text-cyan-400" />
-          <span>Connecting to 1-on-1 video network...</span>
+          <span>Verifying authorization and connecting to video network...</span>
         </div>
       </div>
     );
