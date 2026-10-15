@@ -1,0 +1,133 @@
+rules_version = '2';
+
+// ===============================================================
+// Assumed Data Model & Security Architecture for Bites
+// ===============================================================
+//
+// Collection: users/{userId}
+// Document ID: userId (matches auth.uid)
+// Fields:
+//   - uid: string (required, immutable, must match auth.uid)
+//   - email: string (required, email format)
+//   - gender: string (optional, allowed values: "Male", "Female", "Other")
+//   - isVerified: bool (optional)
+//   - status: string (required, allowed: "idle", "in-queue", "in-call")
+//   - createdAt: timestamp (server timestamp)
+//   - updatedAt: timestamp (server timestamp)
+//
+// Collection: match_queue/{userId}
+// Document ID: userId (matches auth.uid of the waiting user)
+// Fields:
+//   - userId: string (required, matches userId)
+//   - peerId: string (required, WebRTC PeerJS identifier)
+//   - userEmail: string (optional)
+//   - status: string (required, allowed: "waiting", "matched", "cancelled")
+//   - matchId: string (nullable, set when matched)
+//   - createdAt: number (epoch milliseconds timestamp)
+//
+// Collection: matches/{matchId}
+// Document ID: unique match identifier (e.g., match_<timestamp>_<random>)
+// Fields:
+//   - matchId: string (required, matches document ID)
+//   - initiatorPeerId: string (required, PeerJS ID of caller)
+//   - initiatorUid: string (required, auth.uid of caller)
+//   - receiverPeerId: string (required, PeerJS ID of callee)
+//   - receiverUid: string (required, auth.uid of callee)
+//   - status: string (required, allowed: "active", "ended")
+//   - createdAt: number (epoch milliseconds)
+//   - endedAt: timestamp (optional)
+//
+// ===============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isParticipant(matchData) {
+      return isAuthenticated() && (
+        request.auth.uid == matchData.initiatorUid ||
+        request.auth.uid == matchData.receiverUid
+      );
+    }
+
+    // Default deny for all unspecified collections
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // -------------------------------------------------------------
+    // Users Collection
+    // -------------------------------------------------------------
+    match /users/{userId} {
+      // Users can only read and manage their own profile
+      allow get: if isOwner(userId);
+      allow list: if false;
+
+      allow create: if isOwner(userId)
+        && request.resource.data.uid == userId;
+
+      allow update: if isOwner(userId)
+        && request.resource.data.uid == resource.data.uid;
+
+      allow delete: if false;
+    }
+
+    // -------------------------------------------------------------
+    // Matchmaking Queue Collection
+    // -------------------------------------------------------------
+    match /match_queue/{userId} {
+      // Authenticated users can list waiting peers to find a match,
+      // and read candidate documents
+      allow list: if isAuthenticated();
+      allow get: if isAuthenticated();
+
+      // Users can create/queue their own ticket
+      allow create: if isOwner(userId)
+        && request.resource.data.userId == userId
+        && request.resource.data.status == "waiting";
+
+      // Ticket owner can update their ticket OR another authenticated peer
+      // can atomically transition status from 'waiting' to 'matched'
+      allow update: if isAuthenticated() && (
+        isOwner(userId) ||
+        (resource.data.status == "waiting" && request.resource.data.status == "matched")
+      );
+
+      // Ticket owner can delete their own ticket when leaving or skipping,
+      // or cleanup stale tickets
+      allow delete: if isAuthenticated() && (
+        isOwner(userId) ||
+        (request.time.toMillis() - resource.data.createdAt > 20000)
+      );
+    }
+
+    // -------------------------------------------------------------
+    // Matches Collection
+    // -------------------------------------------------------------
+    match /matches/{matchId} {
+      // Only the two matched participants can read or listen to the match
+      allow get: if isParticipant(resource.data);
+      allow list: if false;
+
+      // The initiator creates the active match document
+      allow create: if isAuthenticated()
+        && request.auth.uid == request.resource.data.initiatorUid
+        && request.resource.data.status == "active";
+
+      // Either participant can update status to 'ended' (e.g., skip / leave)
+      allow update: if isParticipant(resource.data)
+        && request.resource.data.initiatorUid == resource.data.initiatorUid
+        && request.resource.data.receiverUid == resource.data.receiverUid;
+
+      allow delete: if false;
+    }
+  }
+}
