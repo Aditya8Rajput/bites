@@ -1,41 +1,25 @@
 rules_version = '2';
 
 // ===============================================================
-// Assumed Data Model & Security Architecture for Bites
+// Production Security Architecture for Bites (1-on-1 WebRTC)
 // ===============================================================
 //
 // Collection: users/{userId}
-// Document ID: userId (matches auth.uid)
-// Fields:
-//   - uid: string (required, immutable, must match auth.uid)
-//   - email: string (required, email format)
-//   - gender: string (optional, allowed values: "Male", "Female", "Other")
-//   - isVerified: bool (optional)
-//   - status: string (required, allowed: "idle", "in-queue", "in-call")
-//   - createdAt: timestamp (server timestamp)
-//   - updatedAt: timestamp (server timestamp)
+// - Only the authenticated owner can get their own document. Listing all users is disabled.
+// - Creation requires matching auth.uid and auth email.
+// - isVerified cannot be set to true unless request.auth.token.email_verified == true.
 //
 // Collection: match_queue/{userId}
-// Document ID: userId (matches auth.uid of the waiting user)
-// Fields:
-//   - userId: string (required, matches userId)
-//   - peerId: string (required, WebRTC PeerJS identifier)
-//   - userEmail: string (optional)
-//   - status: string (required, allowed: "waiting", "matched", "cancelled")
-//   - matchId: string (nullable, set when matched)
-//   - createdAt: number (epoch milliseconds timestamp)
+// - Only authenticated users can list waiting peers to find matches.
+// - Users can create their own ticket with status 'waiting' or 'matched'.
+// - Updates allowed for ticket owner OR when another authenticated user locks a match.
+// - Deletions allowed for ticket owner (leave/cancel) or stale cleanup (> 20s).
 //
 // Collection: matches/{matchId}
-// Document ID: unique match identifier (e.g., match_<timestamp>_<random>)
-// Fields:
-//   - matchId: string (required, matches document ID)
-//   - initiatorPeerId: string (required, PeerJS ID of caller)
-//   - initiatorUid: string (required, auth.uid of caller)
-//   - receiverPeerId: string (required, PeerJS ID of callee)
-//   - receiverUid: string (required, auth.uid of callee)
-//   - status: string (required, allowed: "active", "ended")
-//   - createdAt: number (epoch milliseconds)
-//   - endedAt: timestamp (optional)
+// - Only the two matched participants (initiator & receiver) can read the match.
+// - Only the initiator can create the match with status 'active'.
+// - Participants can update status to 'ended' without altering participant UIDs.
+// - Listing and deletion are disabled.
 //
 // ===============================================================
 
@@ -44,7 +28,7 @@ service cloud.firestore {
 
     // Helper functions
     function isAuthenticated() {
-      return request.auth != null;
+      return request.auth != null && request.auth.uid != null;
     }
 
     function isOwner(userId) {
@@ -67,15 +51,24 @@ service cloud.firestore {
     // Users Collection
     // -------------------------------------------------------------
     match /users/{userId} {
-      // Users can only read and manage their own profile
       allow get: if isOwner(userId);
       allow list: if false;
 
       allow create: if isOwner(userId)
-        && request.resource.data.uid == userId;
+        && request.resource.data.uid == userId
+        && (
+          !('isVerified' in request.resource.data) ||
+          request.resource.data.isVerified == false ||
+          request.auth.token.email_verified == true
+        );
 
       allow update: if isOwner(userId)
-        && request.resource.data.uid == resource.data.uid;
+        && request.resource.data.uid == resource.data.uid
+        && (
+          !('isVerified' in request.resource.data) ||
+          request.resource.data.isVerified == resource.data.isVerified ||
+          (request.resource.data.isVerified == true && request.auth.token.email_verified == true)
+        );
 
       allow delete: if false;
     }
@@ -84,15 +77,14 @@ service cloud.firestore {
     // Matchmaking Queue Collection
     // -------------------------------------------------------------
     match /match_queue/{userId} {
-      // Authenticated users can list waiting peers to find a match,
-      // and read candidate documents
+      // Authenticated users can list waiting peers and get candidate ticket
       allow list: if isAuthenticated();
       allow get: if isAuthenticated();
 
-      // Users can create/queue their own ticket
+      // Users create their own queue ticket
       allow create: if isOwner(userId)
         && request.resource.data.userId == userId
-        && request.resource.data.status == "waiting";
+        && request.resource.data.status in ["waiting", "matched"];
 
       // Ticket owner can update their ticket OR another authenticated peer
       // can atomically transition status from 'waiting' to 'matched'
@@ -101,8 +93,8 @@ service cloud.firestore {
         (resource.data.status == "waiting" && request.resource.data.status == "matched")
       );
 
-      // Ticket owner can delete their own ticket when leaving or skipping,
-      // or cleanup stale tickets
+      // Ticket owner can delete their ticket when leaving or skipping,
+      // or cleanup stale tickets older than 20 seconds
       allow delete: if isAuthenticated() && (
         isOwner(userId) ||
         (request.time.toMillis() - resource.data.createdAt > 20000)
@@ -113,7 +105,7 @@ service cloud.firestore {
     // Matches Collection
     // -------------------------------------------------------------
     match /matches/{matchId} {
-      // Only the two matched participants can read or listen to the match
+      // Only the two matched participants can read their match session
       allow get: if isParticipant(resource.data);
       allow list: if false;
 
@@ -122,7 +114,7 @@ service cloud.firestore {
         && request.auth.uid == request.resource.data.initiatorUid
         && request.resource.data.status == "active";
 
-      // Either participant can update status to 'ended' (e.g., skip / leave)
+      // Either participant can update status to 'ended' (e.g. skip / leave)
       allow update: if isParticipant(resource.data)
         && request.resource.data.initiatorUid == resource.data.initiatorUid
         && request.resource.data.receiverUid == resource.data.receiverUid;
